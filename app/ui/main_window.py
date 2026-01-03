@@ -6,6 +6,9 @@ from PySide6.QtGui import *
 import app.util.config as config
 from app.ui.library import LibraryDelegate, get_h
 
+# Detect Project Root based on this file's location (app/ui/main_window.py)
+ROOT = Path(__file__).parent.parent.parent.absolute()
+
 def nat_sort(s): return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)]
 
 class ClickSlider(QSlider):
@@ -26,12 +29,19 @@ class MainWindow(QMainWindow):
     def __init__(self, player, backend):
         super().__init__(); self.player, self.backend = player, backend
         self.cfg = config.load(); self.checked_paths = set()
-        self.setWindowTitle("VLC Sane Edition"); self.resize(1600, 900)
+        self.setWindowTitle("Vibe Video Player"); self.resize(1600, 900)
         self.setStyleSheet("background:#0a0a0a; color:white;"); self.setMouseTracking(True)
         
-        def icn(k): return QIcon(f"resources/icons/{k}.png")
+        # Absolute Asset Loading
+        def icn(k): 
+            icon_p = ROOT / "resources" / "icons" / f"{k}.png"
+            return QIcon(str(icon_p))
+
         self.icns = {k: icn(k) for k in ["play","pause","playlist","folder","settings"]}
-        self.worker = subprocess.Popen([sys.executable, "app/util/worker.py"], stdin=subprocess.PIPE, text=True, bufsize=1)
+        
+        # Absolute Worker Launch
+        worker_script = ROOT / "app" / "util" / "worker.py"
+        self.worker = subprocess.Popen([sys.executable, str(worker_script)], stdin=subprocess.PIPE, text=True, bufsize=1)
         
         cw = QWidget(); self.setCentralWidget(cw); root_lay = QHBoxLayout(cw); root_lay.setContentsMargins(0,0,0,0); root_lay.setSpacing(0)
         self.split = QSplitter(Qt.Horizontal); root_lay.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
@@ -39,7 +49,7 @@ class MainWindow(QMainWindow):
         # LEFT
         self.sb_l = QWidget(); l_lay = QVBoxLayout(self.sb_l); l_lay.setContentsMargins(0,0,0,0)
         self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setIndentation(15)
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
+        self.tree.setColumnCount(1); self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
         self.tree.setStyleSheet("background:#111; border:none;")
         self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths)); l_lay.addWidget(self.tree)
         self.ov = QWidget(self.tree.viewport()); self.ov.hide(); self.ov.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -55,10 +65,15 @@ class MainWindow(QMainWindow):
             s = QSlider(Qt.Horizontal); s.setRange(min_v, max_v); s.setValue(val)
             s.valueChanged.connect(lambda v, k=key, lb=t, name=lbl: self.set_vis_cfg(k, v, lb, name))
             bl.addWidget(t); bl.addWidget(s); return box
-        grid.addWidget(self.tog_hide, 0, 0); grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1); grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
+        grid.addWidget(self.tog_hide, 0, 0)
+        grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1)
+        grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
         l_lay.addWidget(self.opt_shelf)
-        footer = QHBoxLayout(); btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
-        btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30); footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); l_lay.addLayout(footer); self.split.addWidget(self.sb_l)
+
+        footer = QHBoxLayout(); footer.setContentsMargins(5,5,5,5)
+        btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
+        btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30)
+        footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); l_lay.addLayout(footer); self.split.addWidget(self.sb_l)
 
         # CENTER
         self.center_pane = QWidget(); self.center_lay = QVBoxLayout(self.center_pane); self.center_lay.setContentsMargins(0,0,0,0)
@@ -126,7 +141,7 @@ class MainWindow(QMainWindow):
         except: pass
     def on_tree_click(self, it, col):
         p = it.data(0, Qt.UserRole)
-        if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 30:
+        if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 35:
             if p in self.checked_paths: self.checked_paths.remove(p)
             else: self.checked_paths.add(p)
             self.tree.viewport().update()
@@ -162,21 +177,16 @@ class MainWindow(QMainWindow):
         info = f"{parts[-3]} | {parts[-2]} | {parts[-1]}" if len(parts) >= 3 else Path(path).name
         for i in range(self.plist.count()):
             if self.plist.item(i).data(Qt.UserRole) == path: return
-        li = QListWidgetItem(info) # Fixed: No 'data' keyword
-        li.setData(Qt.UserRole, path)
-        self.plist.addItem(li)
+        li = QListWidgetItem(info); li.setData(Qt.UserRole, path); self.plist.addItem(li)
         self.sort_pl()
     def sort_pl(self):
         items = []
         for i in range(self.plist.count()):
             it = self.plist.item(i); items.append({'i': it.text(), 'p': it.data(Qt.UserRole)})
         items.sort(key=lambda x: nat_sort(x['p'])); self.plist.clear()
-        for x in items:
-            li = QListWidgetItem(x['i'])
-            li.setData(Qt.UserRole, x['p'])
-            self.plist.addItem(li)
+        for x in items: li = QListWidgetItem(x['i'], data=x['p']); self.plist.addItem(li)
     def p_m(self, p): 
-        self.add_to_pl(p); self.ov.hide(); self.backend.stop_prev(); self.backend.open_main(p)
+        self.ov.hide(); self.backend.stop_prev(); self.backend.open_main(p)
         for i in range(self.plist.count()):
             if self.plist.item(i).data(Qt.UserRole) == p: self.plist.setCurrentRow(i); break
     def play_next(self):
@@ -189,15 +199,19 @@ class MainWindow(QMainWindow):
         m = self.backend.main_player; state = self.backend.get_state_safe()
         self.bp.setIcon(self.icns["pause" if state == 3 else "play"])
         if state == 6 and self.plist.count() > 0: self.play_next()
-        d, cur = self.backend.main_player.get_length(), self.backend.main_player.get_time()
+        d, cur = m.get_length(), m.get_time()
         if d > 0 and not self.sk.isSliderDown(): self.sk.setValue(int((cur/d)*1000))
         if d > 0: self.lbl_t.setText(f"{cur//60000}:{(cur//1000)%60:02} / {d//60000}:{(d//1000)%60:02}")
         it = QTreeWidgetItemIterator(self.tree)
         while it.value():
             item = it.value(); p = str(item.data(0, Qt.UserRole))
             if item.data(0, Qt.DecorationRole) is None and not os.path.isdir(p) and p != "None":
-                tp = os.path.join("resources/thumbs", f"{get_h(p)}.jpg")
+                tp = os.path.join(str(ROOT), "resources", "thumbs", f"{get_h(p)}.jpg")
                 if os.path.exists(tp): item.setData(0, Qt.DecorationRole, QPixmap(tp))
-                else: self.worker.stdin.write(f"{p}|{self.cfg['preview_start']}\n"); self.worker.stdin.flush()
+                else:
+                    try:
+                        self.worker.stdin.write(f"{p}|{self.cfg['preview_start']}\n")
+                        self.worker.stdin.flush()
+                    except BrokenPipeError: pass
             it += 1
     def closeEvent(self, e): self.worker.terminate(); self.backend.release(); e.accept()

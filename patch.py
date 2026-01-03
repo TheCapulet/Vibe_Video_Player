@@ -1,6 +1,16 @@
 import os, urllib.request, sys, json, re
+from pathlib import Path
 
-print("--- APPLYING V78: FIXING PLAYLIST DATA CRASH ---")
+print("--- APPLYING V79: PATH INDEPENDENCE & PORTABILITY FIX ---")
+
+# Detect the actual project root where this patch is running
+ROOT = Path(__file__).parent.absolute()
+
+def write_f(p, c):
+    full_path = ROOT / p
+    os.makedirs(full_path.parent, exist_ok=True)
+    with open(full_path, "w", encoding="utf-8") as f: f.write(c.strip())
+    print(f"FIXED: {p}")
 
 def dl_assets():
     icons = {
@@ -10,21 +20,72 @@ def dl_assets():
         "pause": "https://img.icons8.com/m/ios-filled/50/ffffff/pause.png",
         "settings": "https://img.icons8.com/m/ios-filled/50/ffffff/settings.png"
     }
-    os.makedirs("resources/icons", exist_ok=True)
+    icon_dir = ROOT / "resources" / "icons"
+    os.makedirs(icon_dir, exist_ok=True)
     for name, url in icons.items():
-        p = f"resources/icons/{name}.png"
+        p = icon_dir / f"{name}.png"
+        if not p.exists():
+            try:
+                opener = urllib.request.build_opener()
+                opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+                urllib.request.install_opener(opener).retrieve(url, str(p))
+            except: pass
+
+# --- 1. UPDATED BACKEND (Handle Safety) ---
+backend_logic = r'''
+import vlc, threading, time
+class VLCBackend:
+    def __init__(self):
+        self.lock = threading.Lock()
         try:
-            opener = urllib.request.build_opener()
-            opener.addheaders = [('User-agent', 'Mozilla/5.0')]
-            urllib.request.install_opener(opener).retrieve(url, p)
-        except: pass
+            self.main_inst = vlc.Instance("--quiet", "--no-osd")
+            self.main_player = self.main_inst.media_player_new()
+            self.main_player.video_set_mouse_input(False)
+            self.main_player.video_set_key_input(False)
+            self.prev_inst = vlc.Instance("--quiet", "--no-audio", "--no-osd", "--avcodec-hw=none")
+            self.prev_player = self.prev_inst.media_player_new()
+            self.prev_player.video_set_mouse_input(False)
+            self.ready = True
+        except: self.ready = False
+    def get_state_safe(self):
+        try: return self.main_player.get_state() if self.ready else 0
+        except: return 0
+    def attach_main(self, h): 
+        if self.ready: self.main_player.set_hwnd(h)
+    def attach_prev(self, h): 
+        if self.ready: self.prev_player.set_hwnd(h)
+    def open_main(self, p):
+        if not self.ready: return
+        with self.lock:
+            self.main_player.set_media(self.main_inst.media_new(p))
+            self.main_player.play()
+    def open_prev(self, p, start_sec=0):
+        if not self.ready: return
+        threading.Thread(target=self._exec_prev, args=(p, start_sec), daemon=True).start()
+    def _exec_prev(self, p, s):
+        with self.lock:
+            try:
+                self.prev_player.stop()
+                self.prev_player.set_media(self.prev_inst.media_new(p))
+                self.prev_player.play()
+                for _ in range(10):
+                    if self.prev_player.get_length() > 0: break
+                    time.sleep(0.05)
+                self.prev_player.set_time(s * 1000)
+                self.prev_player.audio_set_mute(True)
+            except: pass
+    def stop_prev(self):
+        if self.ready:
+            with self.lock: self.prev_player.stop()
+    def set_vol(self, v): 
+        if self.ready: self.main_player.audio_set_volume(v)
+    def release(self):
+        if self.ready:
+            self.main_player.stop(); self.prev_player.stop()
+            self.main_inst.release(); self.prev_inst.release()
+'''
 
-def write_f(p, c):
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f: f.write(c.strip())
-    print(f"DONE: {p}")
-
-# --- UI LOGIC (Fixed Data Handling) ---
+# --- 2. UPDATED MAIN WINDOW (Absolute Paths) ---
 ui_logic = r'''
 import os, time, subprocess, hashlib, vlc, sys, threading, random, re
 from pathlib import Path
@@ -33,6 +94,9 @@ from PySide6.QtCore import *
 from PySide6.QtGui import *
 import app.util.config as config
 from app.ui.library import LibraryDelegate, get_h
+
+# Detect Project Root based on this file's location (app/ui/main_window.py)
+ROOT = Path(__file__).parent.parent.parent.absolute()
 
 def nat_sort(s): return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)]
 
@@ -54,12 +118,19 @@ class MainWindow(QMainWindow):
     def __init__(self, player, backend):
         super().__init__(); self.player, self.backend = player, backend
         self.cfg = config.load(); self.checked_paths = set()
-        self.setWindowTitle("VLC Sane Edition"); self.resize(1600, 900)
+        self.setWindowTitle("Vibe Video Player"); self.resize(1600, 900)
         self.setStyleSheet("background:#0a0a0a; color:white;"); self.setMouseTracking(True)
         
-        def icn(k): return QIcon(f"resources/icons/{k}.png")
+        # Absolute Asset Loading
+        def icn(k): 
+            icon_p = ROOT / "resources" / "icons" / f"{k}.png"
+            return QIcon(str(icon_p))
+
         self.icns = {k: icn(k) for k in ["play","pause","playlist","folder","settings"]}
-        self.worker = subprocess.Popen([sys.executable, "app/util/worker.py"], stdin=subprocess.PIPE, text=True, bufsize=1)
+        
+        # Absolute Worker Launch
+        worker_script = ROOT / "app" / "util" / "worker.py"
+        self.worker = subprocess.Popen([sys.executable, str(worker_script)], stdin=subprocess.PIPE, text=True, bufsize=1)
         
         cw = QWidget(); self.setCentralWidget(cw); root_lay = QHBoxLayout(cw); root_lay.setContentsMargins(0,0,0,0); root_lay.setSpacing(0)
         self.split = QSplitter(Qt.Horizontal); root_lay.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
@@ -67,7 +138,7 @@ class MainWindow(QMainWindow):
         # LEFT
         self.sb_l = QWidget(); l_lay = QVBoxLayout(self.sb_l); l_lay.setContentsMargins(0,0,0,0)
         self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setIndentation(15)
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
+        self.tree.setColumnCount(1); self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
         self.tree.setStyleSheet("background:#111; border:none;")
         self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths)); l_lay.addWidget(self.tree)
         self.ov = QWidget(self.tree.viewport()); self.ov.hide(); self.ov.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -83,10 +154,15 @@ class MainWindow(QMainWindow):
             s = QSlider(Qt.Horizontal); s.setRange(min_v, max_v); s.setValue(val)
             s.valueChanged.connect(lambda v, k=key, lb=t, name=lbl: self.set_vis_cfg(k, v, lb, name))
             bl.addWidget(t); bl.addWidget(s); return box
-        grid.addWidget(self.tog_hide, 0, 0); grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1); grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
+        grid.addWidget(self.tog_hide, 0, 0)
+        grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1)
+        grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
         l_lay.addWidget(self.opt_shelf)
-        footer = QHBoxLayout(); btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
-        btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30); footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); l_lay.addLayout(footer); self.split.addWidget(self.sb_l)
+
+        footer = QHBoxLayout(); footer.setContentsMargins(5,5,5,5)
+        btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
+        btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30)
+        footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); l_lay.addLayout(footer); self.split.addWidget(self.sb_l)
 
         # CENTER
         self.center_pane = QWidget(); self.center_lay = QVBoxLayout(self.center_pane); self.center_lay.setContentsMargins(0,0,0,0)
@@ -154,7 +230,7 @@ class MainWindow(QMainWindow):
         except: pass
     def on_tree_click(self, it, col):
         p = it.data(0, Qt.UserRole)
-        if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 30:
+        if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 35:
             if p in self.checked_paths: self.checked_paths.remove(p)
             else: self.checked_paths.add(p)
             self.tree.viewport().update()
@@ -190,21 +266,16 @@ class MainWindow(QMainWindow):
         info = f"{parts[-3]} | {parts[-2]} | {parts[-1]}" if len(parts) >= 3 else Path(path).name
         for i in range(self.plist.count()):
             if self.plist.item(i).data(Qt.UserRole) == path: return
-        li = QListWidgetItem(info) # Fixed: No 'data' keyword
-        li.setData(Qt.UserRole, path)
-        self.plist.addItem(li)
+        li = QListWidgetItem(info); li.setData(Qt.UserRole, path); self.plist.addItem(li)
         self.sort_pl()
     def sort_pl(self):
         items = []
         for i in range(self.plist.count()):
             it = self.plist.item(i); items.append({'i': it.text(), 'p': it.data(Qt.UserRole)})
         items.sort(key=lambda x: nat_sort(x['p'])); self.plist.clear()
-        for x in items:
-            li = QListWidgetItem(x['i'])
-            li.setData(Qt.UserRole, x['p'])
-            self.plist.addItem(li)
+        for x in items: li = QListWidgetItem(x['i'], data=x['p']); self.plist.addItem(li)
     def p_m(self, p): 
-        self.add_to_pl(p); self.ov.hide(); self.backend.stop_prev(); self.backend.open_main(p)
+        self.ov.hide(); self.backend.stop_prev(); self.backend.open_main(p)
         for i in range(self.plist.count()):
             if self.plist.item(i).data(Qt.UserRole) == p: self.plist.setCurrentRow(i); break
     def play_next(self):
@@ -217,21 +288,26 @@ class MainWindow(QMainWindow):
         m = self.backend.main_player; state = self.backend.get_state_safe()
         self.bp.setIcon(self.icns["pause" if state == 3 else "play"])
         if state == 6 and self.plist.count() > 0: self.play_next()
-        d, cur = self.backend.main_player.get_length(), self.backend.main_player.get_time()
+        d, cur = m.get_length(), m.get_time()
         if d > 0 and not self.sk.isSliderDown(): self.sk.setValue(int((cur/d)*1000))
         if d > 0: self.lbl_t.setText(f"{cur//60000}:{(cur//1000)%60:02} / {d//60000}:{(d//1000)%60:02}")
         it = QTreeWidgetItemIterator(self.tree)
         while it.value():
             item = it.value(); p = str(item.data(0, Qt.UserRole))
             if item.data(0, Qt.DecorationRole) is None and not os.path.isdir(p) and p != "None":
-                tp = os.path.join("resources/thumbs", f"{get_h(p)}.jpg")
+                tp = os.path.join(str(ROOT), "resources", "thumbs", f"{get_h(p)}.jpg")
                 if os.path.exists(tp): item.setData(0, Qt.DecorationRole, QPixmap(tp))
-                else: self.worker.stdin.write(f"{p}|{self.cfg['preview_start']}\n"); self.worker.stdin.flush()
+                else:
+                    try:
+                        self.worker.stdin.write(f"{p}|{self.cfg['preview_start']}\n")
+                        self.worker.stdin.flush()
+                    except BrokenPipeError: pass
             it += 1
     def closeEvent(self, e): self.worker.terminate(); self.backend.release(); e.accept()
 '''
 
 if __name__ == "__main__":
     dl_assets()
+    write_f("app/core/vlc_backend.py", backend_logic)
     write_f("app/ui/main_window.py", ui_logic)
-    print("\n--- PHASE 78 RECOVERY COMPLETE. RUN app/main.py ---")
+    print("\n--- PHASE 79 PORTABLE READY. RUN app/main.py ---")

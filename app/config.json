@@ -1,1 +1,16 @@
-{"folders": ["F:/Videos/Stranger Things"]}
+{
+    "folders": [
+        "F:/Videos/Stranger Things",
+        "F:/VIdeos/Fallout"
+    ],
+    "text_size": 10,
+    "preview_start": 120,
+    "card_width": 220,
+    "show_static": true,
+    "show_video": true,
+    "volume": 70,
+    "sidebar_width": 332,
+    "autohide_windowed": false,
+    "nicknames": {},
+    "playlist": []
+}
