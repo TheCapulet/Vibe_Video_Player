@@ -1,0 +1,20 @@
+{
+    "folders": [
+        "F:/Videos"
+    ],
+    "text_size": 10,
+    "preview_start": 215,
+    "card_width": 205,
+    "show_static": true,
+    "show_video": false,
+    "volume": 100,
+    "sidebar_width": 339,
+    "autohide_windowed": false,
+    "nicknames": {
+        "F:/Videos": "TV Shows"
+    },
+    "playlist": [],
+    "hw_accel": false,
+    "shuffle": false,
+    "repeat": false
+}
