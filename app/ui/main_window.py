@@ -1,10 +1,16 @@
-import os, time, subprocess, hashlib, vlc, sys, threading, random, re
+import os, time, subprocess, hashlib, vlc, sys, threading, random, re, logging, socket
+from queue import PriorityQueue
+import itertools
+import queue
 from pathlib import Path
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 import app.util.config as config
 from app.ui.library import LibraryDelegate, get_h
+from app.util.logger import setup_app_logger
+
+logger = setup_app_logger("MAIN_WINDOW")
 
 ROOT = Path(__file__).parent.parent.parent.absolute()
 def nat_sort(s): return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)]
@@ -23,17 +29,381 @@ class VideoWidget(QWidget):
     def mouseDoubleClickEvent(self, e): self.double_clicked.emit()
     def mouseMoveEvent(self, e): self.mouse_moved.emit(); super().mouseMoveEvent(e)
 
+class TitleBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._window = parent
+        self.setFixedHeight(34)
+        self.setObjectName("title_bar")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6,0,6,0)
+        lay.setSpacing(6)
+        self.icon_lbl = QLabel(); self.icon_lbl.setFixedSize(20,20)
+        # Title label starts empty; main window will populate with current media title
+        self.title_lbl = QLabel("")
+        self.title_lbl.setStyleSheet("font-weight:600; color: white; background: transparent;")
+        lay.addWidget(self.icon_lbl)
+        lay.addWidget(self.title_lbl)
+        lay.addStretch()
+        self.btn_min = QPushButton(); self.btn_min.setFixedSize(28,20)
+        self.btn_max = QPushButton(); self.btn_max.setFixedSize(28,20)
+        self.btn_close = QPushButton(); self.btn_close.setFixedSize(28,20)
+        for b in (self.btn_min, self.btn_max, self.btn_close):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet("background:transparent; color:white; border:none;")
+        # Use platform style icons for titlebar controls for better appearance
+        try:
+            self.btn_min.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMinButton))
+            self.btn_max.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+            self.btn_close.setIcon(self.style().standardIcon(QStyle.SP_TitleBarCloseButton))
+        except Exception:
+            # fall back to text glyphs
+            self.btn_min.setText("—"); self.btn_max.setText("▢"); self.btn_close.setText("✕")
+        lay.addWidget(self.btn_min); lay.addWidget(self.btn_max); lay.addWidget(self.btn_close)
+        if self._window is not None:
+            self.btn_min.clicked.connect(self._window.showMinimized)
+            self.btn_max.clicked.connect(self._toggle_max_restore)
+            self.btn_close.clicked.connect(self._window.close)
+        self._drag_pos = None
+
+    def _toggle_max_restore(self):
+        try:
+            if not hasattr(self._window, '_normal_geom'):
+                self._window._normal_geom = None
+            if self._window.isMaximized():
+                # restore to previous normal geometry if known
+                self._window.showNormal()
+                if getattr(self._window, '_normal_geom', None) is not None:
+                    # apply geometry after the window state change
+                    QTimer.singleShot(0, lambda: self._window.setGeometry(self._window._normal_geom))
+            else:
+                # save current geometry then maximize
+                try:
+                    self._window._normal_geom = self._window.geometry()
+                except Exception:
+                    self._window._normal_geom = None
+                self._window.showMaximized()
+        except Exception:
+            logger.exception("Error toggling maximize/restore")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and self._window and not self._window.isMaximized():
+            delta = e.globalPosition().toPoint() - self._drag_pos
+            self._window.move(self._window.pos() + delta)
+            self._drag_pos = e.globalPosition().toPoint()
+        super().mouseMoveEvent(e)
+
+    def _update_max_icon(self):
+        try:
+            if self._window.isMaximized():
+                try:
+                    self.btn_max.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
+                except Exception:
+                    self.btn_max.setText("❐")
+            else:
+                try:
+                    self.btn_max.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+                except Exception:
+                    self.btn_max.setText("▢")
+        except Exception:
+            pass
+
+
 class MainWindow(QMainWindow):
     def __init__(self, player, backend):
         super().__init__(); self.player, self.backend = player, backend
+        # Use a frameless window but keep system hints so resizing still works
+        try:
+            flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint
+            self.setWindowFlags(flags)
+        except Exception:
+            pass
         self.cfg = config.load(); self.checked_paths = set()
         self.setWindowTitle("Vibe Video Player"); self.resize(1600, 900)
         self.setStyleSheet("background:#0a0a0a; color:white;"); self.setMouseTracking(True)
         def icn(k): return QIcon(str(ROOT / "resources" / "icons" / f"{k}.png"))
         self.icns = {k: icn(k) for k in ["play","pause","playlist","folder","settings"]}
-        self.worker = subprocess.Popen([sys.executable, str(ROOT / "app" / "util" / "worker.py")], stdin=subprocess.PIPE, text=True, bufsize=1)
-        cw = QWidget(); self.setCentralWidget(cw); root_lay = QHBoxLayout(cw); root_lay.setContentsMargins(0,0,0,0); root_lay.setSpacing(0)
-        self.split = QSplitter(Qt.Horizontal); root_lay.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
+        # Load the main app icon (prefer generated sizes) and set window icon
+        try:
+            main_icon_path = ROOT / "resources" / "icons" / "sizes" / "main-64.png"
+            if not main_icon_path.exists():
+                main_icon_path = ROOT / "resources" / "icons" / "main.png"
+            if main_icon_path.exists():
+                try:
+                    main_qicon = QIcon(str(main_icon_path))
+                    self.setWindowIcon(main_qicon)
+                    self.icns['main'] = main_qicon
+                except Exception:
+                    logger.exception("Failed to set window icon from %s", main_icon_path)
+        except Exception:
+            logger.exception("Failed to initialize main icon")
+        # Start the thumbnail worker as a subprocess. On Windows, hide the console window.
+        self.worker = None
+        def _make_startupinfo():
+            si = None
+            if sys.platform.startswith("win"):
+                try:
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                except Exception:
+                    logger.exception("Failed to configure subprocess STARTUPINFO")
+                    si = None
+            return si
+
+        # Track last start time to avoid rapid restart loops
+        self._last_worker_start = 0
+
+        def start_worker():
+            # Avoid restarting more than once per second
+            if time.time() - self._last_worker_start < 1:
+                logger.info("Skipping worker restart due to backoff")
+                return None
+            si = _make_startupinfo()
+            try:
+                # Choose an IPC port for the worker to listen on
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+                s.close()
+                self._ipc_port = port
+                # Start worker with ipc port argument. Capture stdout/stderr so we can pipe worker logs into the main logger.
+                proc = subprocess.Popen([
+                    sys.executable, str(ROOT / "app" / "util" / "worker.py"), f"--ipc-port={port}"
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, startupinfo=si)
+                self._last_worker_start = time.time()
+                try:
+                    logger.info("Started worker pid=%s stdout=%s stderr=%s cwd=%s", proc.pid, bool(proc.stdout), bool(proc.stderr), os.getcwd())
+                except Exception:
+                    logger.exception("Started worker but failed to log details")
+                # worker will accept socket connections on the assigned port; we'll connect in the writer thread
+                return proc
+            except Exception:
+                logger.exception("Failed to start worker subprocess")
+                return None
+
+        # start the worker and store reference
+        self.worker = start_worker()
+
+        # If the worker provides stdout/stderr, start threads to forward them to app logger
+        def _drain_pipe(pipe, level=logging.INFO):
+            try:
+                if pipe is None:
+                    return
+                # read bytes and decode lines
+                with pipe:
+                    buf = b''
+                    while True:
+                        chunk = pipe.readline()
+                        if not chunk:
+                            break
+                        try:
+                            line = chunk.decode('utf-8', errors='replace').rstrip('\r\n')
+                        except Exception:
+                            line = str(chunk)
+                        logger.log(level, "[worker] %s", line)
+            except Exception:
+                logger.exception("Error reading worker pipe")
+
+        if self.worker is not None:
+            if getattr(self.worker, 'stdout', None):
+                threading.Thread(target=_drain_pipe, args=(self.worker.stdout, logging.INFO), daemon=True).start()
+            if getattr(self.worker, 'stderr', None):
+                threading.Thread(target=_drain_pipe, args=(self.worker.stderr, logging.ERROR), daemon=True).start()
+
+        def ensure_worker_running():
+            if self.worker is None:
+                logger.info("Worker missing, starting")
+                self.worker = start_worker()
+                # attach drains for new worker
+                if self.worker is not None:
+                    if getattr(self.worker, 'stdout', None):
+                        threading.Thread(target=_drain_pipe, args=(self.worker.stdout, logging.INFO), daemon=True).start()
+                    if getattr(self.worker, 'stderr', None):
+                        threading.Thread(target=_drain_pipe, args=(self.worker.stderr, logging.ERROR), daemon=True).start()
+                return
+
+            if self.worker.poll() is not None:
+                # process has exited; capture any remaining stderr/stdout
+                try:
+                    out = None
+                    err = None
+                    try:
+                        if getattr(self.worker, 'stdout', None):
+                            out = self.worker.stdout.read()
+                    except Exception:
+                        out = None
+                    try:
+                        if getattr(self.worker, 'stderr', None):
+                            err = self.worker.stderr.read()
+                    except Exception:
+                        err = None
+                    if out:
+                        try:
+                            logger.info("Worker stdout on exit: %s", out.decode('utf-8', errors='replace'))
+                        except Exception:
+                            logger.info("Worker stdout on exit: %s", out)
+                    if err:
+                        try:
+                            logger.error("Worker stderr on exit: %s", err.decode('utf-8', errors='replace'))
+                        except Exception:
+                            logger.error("Worker stderr on exit: %s", err)
+                except Exception:
+                    logger.exception("Error while reading worker pipes on exit")
+                logger.info("Worker not running, restarting")
+                self.worker = start_worker()
+                if self.worker is not None:
+                    if getattr(self.worker, 'stdout', None):
+                        threading.Thread(target=_drain_pipe, args=(self.worker.stdout, logging.INFO), daemon=True).start()
+                    if getattr(self.worker, 'stderr', None):
+                        threading.Thread(target=_drain_pipe, args=(self.worker.stderr, logging.ERROR), daemon=True).start()
+
+        self._start_worker = start_worker
+        self._ensure_worker_running = ensure_worker_running
+        # Prioritized queue + socket-based writer thread to serialize thumbnail requests off the UI thread
+        # PriorityQueue entries: (priority, seq, (path, preview)) where lower priority value => higher priority
+        self._thumb_queue = PriorityQueue(maxsize=200)
+        self._pending_thumbs = set()
+        self._seq = itertools.count()
+        # Metrics
+        self._metrics = {
+            'queued': 0,
+            'dropped': 0,
+            'sent': 0,
+            'send_fail': 0,
+            'conn_attempts': 0,
+            'conn_success': 0,
+        }
+
+        def _thumb_writer():
+            sock = None
+            last_port = None
+            while True:
+                try:
+                    item = self._thumb_queue.get()
+                    if item is None:
+                        break
+                    # item is (priority, seq, payload)
+                    if isinstance(item, tuple) and len(item) == 3:
+                        pri, seq, payload = item
+                    else:
+                        # unexpected sentinel/payload
+                        break
+                    # Accept a None payload as the shutdown sentinel
+                    if payload is None:
+                        try:
+                            self._thumb_queue.task_done()
+                        except Exception:
+                            pass
+                        break
+                    p, preview = payload
+                    try:
+                        # Ensure a current worker/process exists; if not, try to start one
+                        try:
+                            self._ensure_worker_running()
+                        except Exception:
+                            logger.exception("Failed to ensure worker before writer socket send")
+
+                        port = getattr(self, '_ipc_port', None)
+                        # If port changed or socket not connected, (re)connect
+                        if sock is None or last_port != port:
+                            if sock:
+                                try:
+                                    sock.close()
+                                except Exception:
+                                    pass
+                                sock = None
+                            if not port:
+                                # No port assigned; back off and requeue
+                                try:
+                                    time.sleep(0.1)
+                                    self._thumb_queue.put_nowait((pri, seq, (p, preview)))
+                                except Exception:
+                                    logger.debug("Failed to requeue while waiting for port: %s", p)
+                                continue
+                            # Attempt to connect with backoff
+                            connected = False
+                            conn_backoff = 0.1
+                            while not connected:
+                                try:
+                                    self._metrics['conn_attempts'] += 1
+                                    sock = socket.create_connection(('127.0.0.1', port), timeout=3)
+                                    last_port = port
+                                    connected = True
+                                    self._metrics['conn_success'] += 1
+                                    conn_backoff = 0.1
+                                except Exception:
+                                    logger.debug("Socket connect failed to port %s; backing off %.1fs", port, conn_backoff)
+                                    time.sleep(conn_backoff)
+                                    conn_backoff = min(conn_backoff * 2, 5.0)
+
+                        # send payload
+                        try:
+                            msg = f"{p}|{preview}\n".encode('utf-8')
+                            sock.sendall(msg)
+                            self._metrics['sent'] += 1
+                            logger.debug("Socket writer sent %d bytes to %s", len(msg), p)
+                        except Exception:
+                            logger.exception("Socket send failed for %s", p)
+                            self._metrics['send_fail'] += 1
+                            try:
+                                sock.close()
+                            except Exception:
+                                pass
+                            sock = None
+                            # Requeue with backoff
+                            try:
+                                time.sleep(0.1)
+                                self._thumb_queue.put_nowait((pri, seq, (p, preview)))
+                            except Exception:
+                                logger.debug("Failed to requeue after socket send failure for %s", p)
+                    finally:
+                        try:
+                            self._pending_thumbs.discard(p)
+                        except Exception:
+                            pass
+                        try:
+                            self._thumb_queue.task_done()
+                        except Exception:
+                            pass
+                except Exception:
+                    logger.exception("Exception in thumb writer loop")
+                    time.sleep(0.1)
+
+        threading.Thread(target=_thumb_writer, daemon=True).start()
+        # Periodic metrics logger to observe queue/connection health
+        try:
+            self._metrics_timer = QTimer()
+            self._metrics_timer.setInterval(5000)
+            self._metrics_timer.timeout.connect(lambda: logger.info("Thumb metrics: %s", self._metrics))
+            self._metrics_timer.start()
+        except Exception:
+            logger.exception("Failed to start metrics timer")
+        cw = QWidget(); self.setCentralWidget(cw)
+        root_v = QVBoxLayout(cw); root_v.setContentsMargins(0,0,0,0); root_v.setSpacing(0)
+        # custom title bar
+        try:
+            self._title_bar = TitleBar(self)
+            # set icon if available
+            try:
+                if 'main' in self.icns:
+                    pm = self.icns['main'].pixmap(20,20)
+                    self._title_bar.icon_lbl.setPixmap(pm)
+            except Exception:
+                logger.exception("Failed to set title bar icon pixmap")
+            self._title_bar.setStyleSheet('background:#0e0e0e;')
+            root_v.addWidget(self._title_bar)
+            try:
+                self._title_bar._update_max_icon()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("Failed to create custom title bar")
+        self.split = QSplitter(Qt.Horizontal); root_v.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
 
         # Sidebar Left
         self.sb_l = QWidget(); l_lay = QVBoxLayout(self.sb_l); l_lay.setContentsMargins(0,0,0,0)
@@ -81,6 +451,18 @@ class MainWindow(QMainWindow):
         rl = QVBoxLayout(self.sb_r); self.plist = QListWidget(); self.plist.itemDoubleClicked.connect(lambda i: self.p_m(i.data(Qt.UserRole)))
         rl.addWidget(QLabel("PLAYLIST")); rl.addWidget(self.plist); self.split.addWidget(self.sb_r)
 
+        # Add a resize grip in the bottom-right so frameless windows can be resized
+        try:
+            grip_holder = QWidget()
+            gh = QHBoxLayout(grip_holder)
+            gh.setContentsMargins(0,0,6,6)
+            gh.addStretch()
+            grip = QSizeGrip(self)
+            gh.addWidget(grip)
+            root_v.addWidget(grip_holder)
+        except Exception:
+            logger.exception("Failed to add QSizeGrip for resizing")
+
         self.hide_timer = QTimer(); self.hide_timer.setInterval(3000); self.hide_timer.setSingleShot(True); self.hide_timer.timeout.connect(self.hide_ui)
         self.sb_l.hide(); self.sb_r.hide()
         self.tree.itemExpanded.connect(self.on_expand); self.tree.itemEntered.connect(self.on_hover)
@@ -88,6 +470,26 @@ class MainWindow(QMainWindow):
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu); self.tree.customContextMenuRequested.connect(self.on_context)
         self.tm = QTimer(); self.tm.setInterval(200); self.tm.timeout.connect(self.upd); self.tm.start()
         self.backend.set_vol(self.cfg["volume"]); QTimer.singleShot(500, self.ref_initial)
+        # Track current playing path for title display
+        self._now_playing = None
+
+    def changeEvent(self, event):
+        try:
+            if event.type() == QEvent.WindowStateChange:
+                # hide title bar in fullscreen
+                is_fs = self.isFullScreen()
+                try:
+                    self._title_bar.setVisible(not is_fs)
+                except Exception:
+                    pass
+                # update maximize/restore icon state
+                try:
+                    self._title_bar._update_max_icon()
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Error handling changeEvent")
+        return super().changeEvent(event)
 
     def on_split(self, pos, idx): 
         if idx == 1: self.cfg["sidebar_width"] = pos; config.save(self.cfg)
@@ -115,17 +517,40 @@ class MainWindow(QMainWindow):
                 it = QTreeWidgetItem(self.tree, [self.cfg["nicknames"].get(f, p.name)])
                 it.setIcon(0, self.icns["folder"]); it.setData(0, Qt.UserRole, f); it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
     def on_expand(self, item):
-        if item.childCount() > 0: return
+        if item.childCount() > 0:
+            return
         p = Path(item.data(0, Qt.UserRole))
+        # Populate folder contents on a background thread to avoid UI blocking
+        def scan_and_populate(path, parent_item):
+            try:
+                entries = []
+                for e in sorted(Path(path).iterdir()):
+                    try:
+                        if e.is_dir():
+                            entries.append(('dir', e.as_posix(), self.cfg["nicknames"].get(e.as_posix(), e.name)))
+                        elif e.suffix.lower() in ('.mp4', '.mkv', '.avi'):
+                            entries.append(('file', e.as_posix(), e.name))
+                    except Exception:
+                        logger.exception("Error enumerating entry %s", e)
+                # schedule UI update on main thread
+                def add_items():
+                    try:
+                        for typ, ep, name in entries:
+                            if typ == 'dir':
+                                c = QTreeWidgetItem(parent_item, [name]); c.setIcon(0, self.icns["folder"]); c.setData(0, Qt.UserRole, ep); c.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                            else:
+                                v = QTreeWidgetItem(parent_item, [name]); v.setData(0, Qt.UserRole, ep)
+                                v.setFlags(v.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable); v.setCheckState(0, Qt.Unchecked)
+                    except Exception:
+                        logger.exception("Error adding scanned items to tree for %s", path)
+                QTimer.singleShot(0, add_items)
+            except Exception:
+                logger.exception("Error scanning folder %s", path)
+
         try:
-            for e in sorted(p.iterdir()):
-                if e.is_dir():
-                    n = self.cfg["nicknames"].get(e.as_posix(), e.name)
-                    c = QTreeWidgetItem(item, [n]); c.setIcon(0, self.icns["folder"]); c.setData(0, Qt.UserRole, e.as_posix()); c.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-                elif e.suffix.lower() in ('.mp4','.mkv','.avi'):
-                    v = QTreeWidgetItem(item, [e.name]); v.setData(0, Qt.UserRole, e.as_posix())
-                    v.setFlags(v.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable); v.setCheckState(0, Qt.Unchecked)
-        except: pass
+            threading.Thread(target=scan_and_populate, args=(p.as_posix(), item), daemon=True).start()
+        except Exception:
+            logger.exception("Failed to start thread to expand folder %s", p)
     def on_tree_click(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 30:
@@ -138,7 +563,11 @@ class MainWindow(QMainWindow):
             rect = self.tree.visualItemRect(it); tw = self.cfg["card_width"]
             self.ov.setFixedSize(tw, int(tw*0.56)); self.ov.move(self.mapFromGlobal(self.tree.viewport().mapToGlobal(rect.topLeft() + QPoint(30, 5))))
             self.ov.show(); self.ov.raise_(); self.backend.open_prev(p, self.cfg["preview_start"])
-        else: self.ov.hide(); self.backend.stop_prev()
+            self._hover_preview = p
+        else:
+            self.ov.hide()
+            self.backend.stop_prev()
+            self._hover_preview = None
     def on_activated(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p): self.p_m(p)
@@ -174,11 +603,23 @@ class MainWindow(QMainWindow):
         for i in range(self.plist.count()):
             it = self.plist.item(i); items.append({'i': it.text(), 'p': it.data(Qt.UserRole)})
         items.sort(key=lambda x: nat_sort(x['p'])); self.plist.clear()
-        for x in items: li = QListWidgetItem(x['i'], data=x['p']); self.plist.addItem(li)
+        for x in items:
+            li = QListWidgetItem(x['i'])
+            li.setData(Qt.UserRole, x['p'])
+            self.plist.addItem(li)
     def p_m(self, p): 
         self.ov.hide(); self.backend.stop_prev(); self.backend.open_main(p)
         for i in range(self.plist.count()):
             if self.plist.item(i).data(Qt.UserRole) == p: self.plist.setCurrentRow(i); break
+        try:
+            self._now_playing = p
+            try:
+                if hasattr(self, '_title_bar') and self._title_bar is not None:
+                    self._title_bar.title_lbl.setText(Path(p).name)
+            except Exception:
+                logger.exception("Failed to set title in title bar for %s", p)
+        except Exception:
+            logger.exception("Error handling play metadata for %s", p)
     def play_next(self):
         if self.plist.count() == 0: return
         idx = (self.plist.currentRow() + 1) % self.plist.count()
@@ -197,7 +638,74 @@ class MainWindow(QMainWindow):
             item = it.value(); p = str(item.data(0, Qt.UserRole))
             if item.data(0, Qt.DecorationRole) is None and not os.path.isdir(p) and p != "None":
                 tp = os.path.join(str(ROOT), "resources", "thumbs", f"{get_h(p)}.jpg")
-                if os.path.exists(tp): item.setData(0, Qt.DecorationRole, QPixmap(tp))
-                else: self.worker.stdin.write(f"{p}|{self.cfg['preview_start']}\n"); self.worker.stdin.flush()
+                if os.path.exists(tp):
+                    item.setData(0, Qt.DecorationRole, QPixmap(tp))
+                else:
+                    try:
+                        # Ensure worker is alive before writing
+                        self._ensure_worker_running()
+                        # Log diagnostics about the worker and stdin before attempting write
+                        try:
+                            wpid = getattr(self.worker, 'pid', None)
+                            wpoll = None if self.worker is None else self.worker.poll()
+                            ipc_port = getattr(self, '_ipc_port', None)
+                            logger.debug("Attempting to request thumbnail: pid=%s poll=%s ipc_port=%s p=%s", wpid, wpoll, ipc_port, p)
+                            if ipc_port:
+                                logger.debug("Worker IPC port: %s", ipc_port)
+                        except Exception:
+                            logger.exception("Failed to collect worker diagnostics before write")
+
+                        # Enqueue the thumbnail request for the writer thread to handle
+                        try:
+                            try:
+                                self._ensure_worker_running()
+                            except Exception:
+                                logger.exception("Failed to ensure worker before enqueue")
+                            try:
+                                # Deduplicate: skip if a request for this path is already pending
+                                if p in self._pending_thumbs:
+                                    logger.debug("Thumbnail request already pending for %s; skipping enqueue", p)
+                                else:
+                                    # Prioritize the currently-hovered preview path
+                                    pri = 0 if getattr(self, '_hover_preview', None) == p else 1
+                                    seq = next(self._seq)
+                                    try:
+                                        self._thumb_queue.put_nowait((pri, seq, (p, self.cfg['preview_start'])))
+                                        self._pending_thumbs.add(p)
+                                        self._metrics['queued'] += 1
+                                        logger.debug("Enqueued thumbnail request for %s (pri=%s)", p, pri)
+                                    except queue.Full:
+                                        self._metrics['dropped'] += 1
+                                        logger.warning("Thumbnail queue full; dropping request for %s", p)
+                                    except Exception:
+                                        logger.exception("Failed to enqueue thumbnail request for %s", p)
+                            except Exception:
+                                logger.exception("Unexpected error while enqueuing thumbnail for %s", p)
+                        except Exception:
+                            logger.exception("Unexpected error while enqueuing thumbnail for %s", p)
+                    except Exception:
+                        logger.exception("Failed to request thumbnail for %s", p)
             it += 1
-    def closeEvent(self, e): self.worker.terminate(); self.backend.release(); e.accept()
+    def closeEvent(self, e):
+        try:
+            # Signal writer thread to exit using a sentinel tuple
+            try:
+                seq = next(self._seq)
+                self._thumb_queue.put_nowait((999999, seq, None))
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("Error signaling writer thread to stop")
+        try:
+            if self.worker:
+                try:
+                    self.worker.terminate()
+                except Exception:
+                    logger.exception("Failed to terminate worker")
+        except Exception:
+            logger.exception("Error while terminating worker on close")
+        try:
+            self.backend.release()
+        except Exception:
+            logger.exception("Error releasing backend on close")
+        e.accept()
