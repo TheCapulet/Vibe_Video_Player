@@ -1,7 +1,7 @@
 import os
 from app.util.logger import setup_app_logger
 
-logger = setup_app_logger("CONTEXT")
+logger = setup_app_logger("SCRIPTS_CONTEXT")
 
 def summarize_project(root_dir, output_file, ignore_list=None):
     if ignore_list is None:

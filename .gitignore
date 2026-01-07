@@ -1,0 +1,5 @@
+/app/resources/thumbs
+/resources/thumbs
+app_debug.log
+app/app_debug.log
+*.log

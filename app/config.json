@@ -1,15 +1,14 @@
 {
     "folders": [
-        "F:/Videos/Stranger Things",
-        "F:/VIdeos/Fallout"
+        "F:/Videos"
     ],
-    "text_size": 10,
+    "text_size": 8,
     "preview_start": 120,
-    "card_width": 220,
+    "card_width": 255,
     "show_static": true,
     "show_video": true,
-    "volume": 70,
-    "sidebar_width": 332,
+    "volume": 80,
+    "sidebar_width": 301,
     "autohide_windowed": false,
     "nicknames": {},
     "playlist": []
