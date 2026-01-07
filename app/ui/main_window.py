@@ -42,8 +42,11 @@ class TitleBar(QWidget):
         # Title label starts empty; main window will populate with current media title
         self.title_lbl = QLabel("")
         self.title_lbl.setStyleSheet("font-weight:600; color: white; background: transparent;")
+        self.title_lbl.setAlignment(Qt.AlignCenter)
         lay.addWidget(self.icon_lbl)
-        lay.addWidget(self.title_lbl)
+        # center the title by sandwiching it between stretches
+        lay.addStretch()
+        lay.addWidget(self.title_lbl, 1)
         lay.addStretch()
         self.btn_min = QPushButton(); self.btn_min.setFixedSize(28,20)
         self.btn_max = QPushButton(); self.btn_max.setFixedSize(28,20)
@@ -113,13 +116,20 @@ class TitleBar(QWidget):
         except Exception:
             pass
 
+    # ensure title is centered visually by constraining its elide behaviour
+    def setTitle(self, text):
+        try:
+            self.title_lbl.setText(text)
+        except Exception:
+            pass
+
 
 class MainWindow(QMainWindow):
     def __init__(self, player, backend):
         super().__init__(); self.player, self.backend = player, backend
-        # Use normal window chrome (disable frameless) so native resizing works
+        # Use frameless window and provide custom hit-testing/resize handles
         try:
-            flags = Qt.Window | Qt.WindowSystemMenuHint | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint
+            flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowSystemMenuHint
             self.setWindowFlags(flags)
         except Exception:
             pass
@@ -401,6 +411,76 @@ class MainWindow(QMainWindow):
                 self._title_bar._update_max_icon()
             except Exception:
                 pass
+        # create resize handles (frameless windows need custom resizing)
+        try:
+            class ResizeHandle(QWidget):
+                def __init__(self, parent, pos):
+                    super().__init__(parent)
+                    self._pos = pos
+                    self._pressed = False
+                    self._start_geo = None
+                    self._start_pt = None
+                    curs = Qt.ArrowCursor
+                    if pos in ('left','right'):
+                        curs = Qt.SizeHorCursor
+                    elif pos in ('top','bottom'):
+                        curs = Qt.SizeVerCursor
+                    elif pos in ('topleft','bottomright'):
+                        curs = Qt.SizeFDiagCursor
+                    elif pos in ('topright','bottomleft'):
+                        curs = Qt.SizeBDiagCursor
+                    self.setCursor(curs)
+                    self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+                def mousePressEvent(self, e):
+                    if e.button() == Qt.LeftButton:
+                        self._pressed = True
+                        self._start_geo = self.parent().geometry()
+                        self._start_pt = e.globalPosition().toPoint()
+                def mouseMoveEvent(self, e):
+                    if not self._pressed: return
+                    try:
+                        cur = e.globalPosition().toPoint(); dx = cur.x() - self._start_pt.x(); dy = cur.y() - self._start_pt.y()
+                        g = self._start_geo
+                        x, y, w, h = g.x(), g.y(), g.width(), g.height()
+                        min_w, min_h = 320, 180
+                        if self._pos == 'left':
+                            nx = x + dx; nw = w - dx
+                            if nw >= min_w: self.parent().setGeometry(nx, y, nw, h)
+                        elif self._pos == 'right':
+                            nw = w + dx
+                            if nw >= min_w: self.parent().setGeometry(x, y, nw, h)
+                        elif self._pos == 'top':
+                            ny = y + dy; nh = h - dy
+                            if nh >= min_h: self.parent().setGeometry(x, ny, w, nh)
+                        elif self._pos == 'bottom':
+                            nh = h + dy
+                            if nh >= min_h: self.parent().setGeometry(x, y, w, nh)
+                        elif self._pos == 'topleft':
+                            nx = x + dx; ny = y + dy; nw = w - dx; nh = h - dy
+                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(nx, ny, nw, nh)
+                        elif self._pos == 'topright':
+                            ny = y + dy; nw = w + dx; nh = h - dy
+                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(x, ny, nw, nh)
+                        elif self._pos == 'bottomleft':
+                            nx = x + dx; nw = w - dx; nh = h + dy
+                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(nx, y, nw, nh)
+                        elif self._pos == 'bottomright':
+                            nw = w + dx; nh = h + dy
+                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(x, y, nw, nh)
+                    except Exception:
+                        logger.exception("Resize handle move error")
+                def mouseReleaseEvent(self, e):
+                    self._pressed = False
+
+            self._resize_handles = {}
+            for pos in ('left','right','top','bottom','topleft','topright','bottomleft','bottomright'):
+                h = ResizeHandle(self, pos)
+                h.setObjectName(f"resize_{pos}")
+                h.setFixedSize(8,8)
+                h.show()
+                self._resize_handles[pos] = h
+        except Exception:
+            logger.exception("Failed to create resize handles")
         except Exception:
             logger.exception("Failed to create custom title bar")
         self.split = QSplitter(Qt.Horizontal); root_v.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
@@ -478,6 +558,29 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("Error handling changeEvent")
         return super().changeEvent(event)
+
+    def resizeEvent(self, e):
+        try:
+            # position resize handles around the window edges
+            r = self.rect()
+            thickness = 8
+            # edges
+            if hasattr(self, '_resize_handles'):
+                try:
+                    self._resize_handles['left'].setGeometry(0, thickness, thickness, r.height()-2*thickness)
+                    self._resize_handles['right'].setGeometry(r.width()-thickness, thickness, thickness, r.height()-2*thickness)
+                    self._resize_handles['top'].setGeometry(thickness, 0, r.width()-2*thickness, thickness)
+                    self._resize_handles['bottom'].setGeometry(thickness, r.height()-thickness, r.width()-2*thickness, thickness)
+                    # corners (square)
+                    self._resize_handles['topleft'].setGeometry(0, 0, thickness, thickness)
+                    self._resize_handles['topright'].setGeometry(r.width()-thickness, 0, thickness, thickness)
+                    self._resize_handles['bottomleft'].setGeometry(0, r.height()-thickness, thickness, thickness)
+                    self._resize_handles['bottomright'].setGeometry(r.width()-thickness, r.height()-thickness, thickness, thickness)
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Error positioning resize handles")
+        return super().resizeEvent(e)
 
     def on_split(self, pos, idx): 
         if idx == 1: self.cfg["sidebar_width"] = pos; config.save(self.cfg)
@@ -581,7 +684,8 @@ class MainWindow(QMainWindow):
             self._now_playing = p
             try:
                 if hasattr(self, '_title_bar') and self._title_bar is not None:
-                    self._title_bar.title_lbl.setText(Path(p).name)
+                    # set centered title via helper
+                    self._title_bar.setTitle(Path(p).name)
             except Exception:
                 logger.exception("Failed to set title in title bar for %s", p)
         except Exception:

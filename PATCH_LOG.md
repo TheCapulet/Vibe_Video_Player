@@ -20,3 +20,14 @@ v083.2 - 2026-01-06
 - Notes:
   - This patch reverts the user-visible regressions while keeping the maximize/restore and title improvements. Run the app to validate.
 
+v083.3 - 2026-01-06
+- Files changed:
+  - app/ui/main_window.py
+- Summary:
+  - Switch to frameless window and implement custom resize handles for native-like resizing on Windows without WM_NCHITTEST.
+  - Center the title text in the custom `TitleBar` and expose `TitleBar.setTitle()` to update on play.
+  - Keep maximize/restore geometry handling from earlier patches.
+- Notes:
+  - This patch adds `ResizeHandle` widgets to implement resizing. If platform-specific behaviors are desired later, consider using native `WM_NCHITTEST` handling for smoother integration.
+
+
