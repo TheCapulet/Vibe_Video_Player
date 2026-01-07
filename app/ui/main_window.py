@@ -117,9 +117,9 @@ class TitleBar(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, player, backend):
         super().__init__(); self.player, self.backend = player, backend
-        # Use a frameless window but keep system hints so resizing still works
+        # Use normal window chrome (disable frameless) so native resizing works
         try:
-            flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint
+            flags = Qt.Window | Qt.WindowSystemMenuHint | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint
             self.setWindowFlags(flags)
         except Exception:
             pass
@@ -451,18 +451,6 @@ class MainWindow(QMainWindow):
         rl = QVBoxLayout(self.sb_r); self.plist = QListWidget(); self.plist.itemDoubleClicked.connect(lambda i: self.p_m(i.data(Qt.UserRole)))
         rl.addWidget(QLabel("PLAYLIST")); rl.addWidget(self.plist); self.split.addWidget(self.sb_r)
 
-        # Add a resize grip in the bottom-right so frameless windows can be resized
-        try:
-            grip_holder = QWidget()
-            gh = QHBoxLayout(grip_holder)
-            gh.setContentsMargins(0,0,6,6)
-            gh.addStretch()
-            grip = QSizeGrip(self)
-            gh.addWidget(grip)
-            root_v.addWidget(grip_holder)
-        except Exception:
-            logger.exception("Failed to add QSizeGrip for resizing")
-
         self.hide_timer = QTimer(); self.hide_timer.setInterval(3000); self.hide_timer.setSingleShot(True); self.hide_timer.timeout.connect(self.hide_ui)
         self.sb_l.hide(); self.sb_r.hide()
         self.tree.itemExpanded.connect(self.on_expand); self.tree.itemEntered.connect(self.on_hover)
@@ -517,40 +505,18 @@ class MainWindow(QMainWindow):
                 it = QTreeWidgetItem(self.tree, [self.cfg["nicknames"].get(f, p.name)])
                 it.setIcon(0, self.icns["folder"]); it.setData(0, Qt.UserRole, f); it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
     def on_expand(self, item):
-        if item.childCount() > 0:
-            return
+        if item.childCount() > 0: return
         p = Path(item.data(0, Qt.UserRole))
-        # Populate folder contents on a background thread to avoid UI blocking
-        def scan_and_populate(path, parent_item):
-            try:
-                entries = []
-                for e in sorted(Path(path).iterdir()):
-                    try:
-                        if e.is_dir():
-                            entries.append(('dir', e.as_posix(), self.cfg["nicknames"].get(e.as_posix(), e.name)))
-                        elif e.suffix.lower() in ('.mp4', '.mkv', '.avi'):
-                            entries.append(('file', e.as_posix(), e.name))
-                    except Exception:
-                        logger.exception("Error enumerating entry %s", e)
-                # schedule UI update on main thread
-                def add_items():
-                    try:
-                        for typ, ep, name in entries:
-                            if typ == 'dir':
-                                c = QTreeWidgetItem(parent_item, [name]); c.setIcon(0, self.icns["folder"]); c.setData(0, Qt.UserRole, ep); c.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-                            else:
-                                v = QTreeWidgetItem(parent_item, [name]); v.setData(0, Qt.UserRole, ep)
-                                v.setFlags(v.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable); v.setCheckState(0, Qt.Unchecked)
-                    except Exception:
-                        logger.exception("Error adding scanned items to tree for %s", path)
-                QTimer.singleShot(0, add_items)
-            except Exception:
-                logger.exception("Error scanning folder %s", path)
-
         try:
-            threading.Thread(target=scan_and_populate, args=(p.as_posix(), item), daemon=True).start()
+            for e in sorted(p.iterdir()):
+                if e.is_dir():
+                    n = self.cfg["nicknames"].get(e.as_posix(), e.name)
+                    c = QTreeWidgetItem(item, [n]); c.setIcon(0, self.icns["folder"]); c.setData(0, Qt.UserRole, e.as_posix()); c.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                elif e.suffix.lower() in ('.mp4','.mkv','.avi'):
+                    v = QTreeWidgetItem(item, [e.name]); v.setData(0, Qt.UserRole, e.as_posix())
+                    v.setFlags(v.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable); v.setCheckState(0, Qt.Unchecked)
         except Exception:
-            logger.exception("Failed to start thread to expand folder %s", p)
+            logger.exception("Error expanding folder %s", p)
     def on_tree_click(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 30:
