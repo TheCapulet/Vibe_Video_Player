@@ -822,6 +822,28 @@ class MainWindow(QMainWindow):
                     except Exception:
                         logger.exception("Failed to request thumbnail for %s", p)
             it += 1
+    def toggle_repeat(self):
+        modes = ['none', 'one', 'all']
+        current_idx = modes.index(self.repeat_mode)
+        self.repeat_mode = modes[(current_idx + 1) % len(modes)]
+        self.bt_repeat.setText(f"Repeat {self.repeat_mode.title()}")
+
+    def toggle_shuffle(self):
+        self.shuffle = not self.shuffle
+        self.bt_shuffle.setText("Shuffle On" if self.shuffle else "Shuffle Off")
+
+    def play_next(self):
+        if self.plist.count() == 0: return
+        if self.repeat_mode == 'one':
+            # Repeat current
+            self.p_m(self.plist.currentItem().data(Qt.UserRole))
+            return
+        idx = self.plist.currentRow()
+        if self.shuffle:
+            idx = random.randint(0, self.plist.count() - 1)
+        else:
+            idx = (idx + 1) % self.plist.count()
+        self.plist.setCurrentRow(idx); self.p_m(self.plist.currentItem().data(Qt.UserRole))
     def closeEvent(self, e):
         try:
             # Signal writer thread to exit using a sentinel tuple

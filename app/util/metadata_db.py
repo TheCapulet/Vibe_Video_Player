@@ -64,6 +64,10 @@ class MetadataDB:
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute('SELECT * FROM shows WHERE tvmaze_id = ?', (tvmaze_id,)).fetchone()
 
+    def get_all_shows(self):
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute('SELECT * FROM shows').fetchall()
+
     def add_season(self, show_id, season_number, image_url=None):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
