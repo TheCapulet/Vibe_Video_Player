@@ -5,10 +5,16 @@ def setup_app_logger(name="APP"):
     logger.setLevel(logging.DEBUG)
     if logger.handlers: return logger
     formatter = logging.Formatter('%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
+    # Full log
     fh = logging.FileHandler("app_debug.log", mode='a', encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+    # Error only log
+    eh = logging.FileHandler("app_debug_error.log", mode='a', encoding='utf-8')
+    eh.setLevel(logging.ERROR)
+    eh.setFormatter(formatter)
+    logger.addHandler(eh)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(formatter)

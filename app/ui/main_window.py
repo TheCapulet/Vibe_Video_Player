@@ -3,12 +3,14 @@ from queue import PriorityQueue
 import itertools
 import queue
 from pathlib import Path
-from PySide6.QtWidgets import *
-from PySide6.QtCore import *
-from PySide6.QtGui import *
+from qtpy.QtWidgets import *
+from qtpy.QtCore import *
+from qtpy.QtGui import *
 import app.util.config as config
 from app.ui.library import LibraryDelegate, get_h
 from app.util.logger import setup_app_logger
+from app.util.metadata_db import MetadataDB
+from app.util.tvmaze_api import TVMazeAPI
 
 logger = setup_app_logger("MAIN_WINDOW")
 
@@ -136,6 +138,7 @@ class MainWindow(QMainWindow):
         self.cfg = config.load(); self.checked_paths = set()
         self.setWindowTitle("Vibe Video Player"); self.resize(1600, 900)
         self.setStyleSheet("background:#0a0a0a; color:white;"); self.setMouseTracking(True)
+        self.db = MetadataDB()
         def icn(k): return QIcon(str(ROOT / "resources" / "icons" / f"{k}.png"))
         self.icns = {k: icn(k) for k in ["play","pause","playlist","folder","settings"]}
         # Load the main app icon (prefer generated sizes) and set window icon
@@ -411,6 +414,8 @@ class MainWindow(QMainWindow):
                 self._title_bar._update_max_icon()
             except Exception:
                 pass
+        except Exception:
+            logger.exception("Failed to create custom title bar")
         # create resize handles (frameless windows need custom resizing)
         try:
             class ResizeHandle(QWidget):
@@ -481,16 +486,16 @@ class MainWindow(QMainWindow):
                 self._resize_handles[pos] = h
         except Exception:
             logger.exception("Failed to create resize handles")
-        except Exception:
-            logger.exception("Failed to create custom title bar")
         self.split = QSplitter(Qt.Horizontal); root_v.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
 
         # Sidebar Left
-        self.sb_l = QWidget(); l_lay = QVBoxLayout(self.sb_l); l_lay.setContentsMargins(0,0,0,0)
+        self.sb_l = QTabWidget(); self.sb_l.setStyleSheet("background:#111;")
+        # Folders tab
+        folders_tab = QWidget(); folders_lay = QVBoxLayout(folders_tab); folders_lay.setContentsMargins(0,0,0,0)
         self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setIndentation(15)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
         self.tree.setStyleSheet("background:#111; border:none;")
-        self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths)); l_lay.addWidget(self.tree)
+        self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths)); folders_lay.addWidget(self.tree)
         self.ov = QWidget(self.tree.viewport()); self.ov.hide(); self.ov.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.backend.attach_prev(int(self.ov.winId()))
 
@@ -504,11 +509,19 @@ class MainWindow(QMainWindow):
             s.valueChanged.connect(lambda v, k=key, lb=t, name=lbl: self.set_vis_cfg(k, v, lb, name))
             bl.addWidget(t); bl.addWidget(s); return box
         grid.addWidget(self.tog_hide, 0, 0); grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1); grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
-        l_lay.addWidget(self.opt_shelf)
+        folders_lay.addWidget(self.opt_shelf)
         footer = QHBoxLayout(); footer.setContentsMargins(5,5,5,5)
         btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
         btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30)
-        footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); l_lay.addLayout(footer); self.split.addWidget(self.sb_l)
+        footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); folders_lay.addLayout(footer)
+        self.sb_l.addTab(folders_tab, "Folders")
+        # Shows tab
+        shows_tab = QWidget(); shows_lay = QVBoxLayout(shows_tab); shows_lay.setContentsMargins(0,0,0,0)
+        self.shows_list = QListWidget(); self.shows_list.setStyleSheet("background:#111; border:none;")
+        self.shows_list.itemDoubleClicked.connect(self.on_show_selected)
+        shows_lay.addWidget(self.shows_list)
+        self.sb_l.addTab(shows_tab, "Shows")
+        self.split.addWidget(self.sb_l)
 
         # Center Player
         self.center_pane = QWidget(); self.center_lay = QVBoxLayout(self.center_pane); self.center_lay.setContentsMargins(0,0,0,0)
@@ -520,9 +533,12 @@ class MainWindow(QMainWindow):
         ctrl_row = QHBoxLayout(); ctrl_row.setContentsMargins(10,5,10,10)
         bt_l = QPushButton(icon=self.icns["playlist"]); bt_l.clicked.connect(lambda: self.sb_l.setVisible(not self.sb_l.isVisible()))
         self.bp = QPushButton(icon=self.icns["play"]); self.bp.clicked.connect(self.backend.main_player.pause)
+        # Add repeat and shuffle buttons
+        self.bt_repeat = QPushButton("Repeat"); self.bt_repeat.clicked.connect(self.toggle_repeat)
+        self.bt_shuffle = QPushButton("Shuffle"); self.bt_shuffle.clicked.connect(self.toggle_shuffle)
         self.vol = QSlider(Qt.Horizontal); self.vol.setFixedWidth(100); self.vol.setRange(0, 100); self.vol.setValue(self.cfg["volume"]); self.vol.valueChanged.connect(self.set_vol_save)
         self.lbl_t = QLabel("0:00 / 0:00"); bt_r = QPushButton(icon=self.icns["playlist"]); bt_r.clicked.connect(lambda: self.sb_r.setVisible(not self.sb_r.isVisible()))
-        ctrl_row.addWidget(bt_l); ctrl_row.addSpacing(10); ctrl_row.addWidget(self.bp); ctrl_row.addStretch()
+        ctrl_row.addWidget(bt_l); ctrl_row.addSpacing(10); ctrl_row.addWidget(self.bp); ctrl_row.addWidget(self.bt_repeat); ctrl_row.addWidget(self.bt_shuffle); ctrl_row.addStretch()
         ctrl_row.addWidget(QLabel("Vol:")); ctrl_row.addWidget(self.vol); ctrl_row.addWidget(self.lbl_t); ctrl_row.addSpacing(10); ctrl_row.addWidget(bt_r)
         cp_lay.addLayout(ctrl_row); self.center_lay.addWidget(self.control_panel); self.backend.attach_main(int(self.v_out.winId())); self.split.addWidget(self.center_pane)
 
@@ -540,6 +556,9 @@ class MainWindow(QMainWindow):
         self.backend.set_vol(self.cfg["volume"]); QTimer.singleShot(500, self.ref_initial)
         # Track current playing path for title display
         self._now_playing = None
+        # Player modes
+        self.repeat_mode = 'none'  # none, one, all
+        self.shuffle = False
 
     def changeEvent(self, event):
         try:
@@ -607,6 +626,7 @@ class MainWindow(QMainWindow):
             if p.exists():
                 it = QTreeWidgetItem(self.tree, [self.cfg["nicknames"].get(f, p.name)])
                 it.setIcon(0, self.icns["folder"]); it.setData(0, Qt.UserRole, f); it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        self.populate_shows()
     def on_expand(self, item):
         if item.childCount() > 0: return
         p = Path(item.data(0, Qt.UserRole))
@@ -620,6 +640,21 @@ class MainWindow(QMainWindow):
                     v.setFlags(v.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable); v.setCheckState(0, Qt.Unchecked)
         except Exception:
             logger.exception("Error expanding folder %s", p)
+        # Try to detect if this folder is a TV show
+        if not item.parent():  # root level
+            detected = TVMazeAPI.auto_detect(p.name)
+            if detected:
+                self.db.add_show(detected['tvmaze_id'], detected['name'], detected['image_url'])
+                cache_dir = Path(ROOT) / "resources" / "thumbs"
+                cache_dir.mkdir(exist_ok=True)
+                cache_path = cache_dir / f"show_{detected['tvmaze_id']}.jpg"
+                if not cache_path.exists() and detected['image_url']:
+                    if TVMazeAPI.download_image(detected['image_url'], str(cache_path)):
+                        self.db.update_show_cached_image(detected['tvmaze_id'], str(cache_path))
+                        # Update item icon
+                        pixmap = QPixmap(str(cache_path))
+                        if not pixmap.isNull():
+                            item.setIcon(0, QIcon(pixmap.scaled(32, 32, Qt.KeepAspectRatio)))
     def on_tree_click(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 30:
@@ -690,16 +725,47 @@ class MainWindow(QMainWindow):
                 logger.exception("Failed to set title in title bar for %s", p)
         except Exception:
             logger.exception("Error handling play metadata for %s", p)
+    def toggle_repeat(self):
+        modes = ['none', 'one', 'all']
+        current_idx = modes.index(self.repeat_mode)
+        self.repeat_mode = modes[(current_idx + 1) % len(modes)]
+        self.bt_repeat.setText(f"Repeat {self.repeat_mode.title()}")
+
+    def populate_shows(self):
+        self.shows_list.clear()
+        shows = self.db.get_all_shows()
+        for show in shows:
+            item = QListWidgetItem(show[2])  # name
+            if show[4]:  # cached_image_path
+                pixmap = QPixmap(show[4])
+                if not pixmap.isNull():
+                    item.setIcon(QIcon(pixmap.scaled(64, 96, Qt.KeepAspectRatio)))
+            item.setData(Qt.UserRole, show[1])  # tvmaze_id
+            self.shows_list.addItem(item)
+
+    def on_show_selected(self, item):
+        tvmaze_id = item.data(Qt.UserRole)
+        # For now, just log; later expand to show seasons/episodes
+        logger.info(f"Selected show: {item.text()} (ID: {tvmaze_id})")
+
     def play_next(self):
         if self.plist.count() == 0: return
-        idx = (self.plist.currentRow() + 1) % self.plist.count()
+        if self.repeat_mode == 'one':
+            # Repeat current
+            self.p_m(self.plist.currentItem().data(Qt.UserRole))
+            return
+        idx = self.plist.currentRow()
+        if self.shuffle:
+            idx = random.randint(0, self.plist.count() - 1)
+        else:
+            idx = (idx + 1) % self.plist.count()
         self.plist.setCurrentRow(idx); self.p_m(self.plist.currentItem().data(Qt.UserRole))
     def upd(self):
         m_pos = self.tree.viewport().mapFromGlobal(QCursor.pos())
         if self.ov.isVisible() and not self.tree.viewport().rect().contains(m_pos): self.ov.hide(); self.backend.stop_prev()
         m = self.backend.main_player; state = self.backend.get_state_safe()
         self.bp.setIcon(self.icns["pause" if state == 3 else "play"])
-        if state == 6 and self.plist.count() > 0: self.play_next()
+        if state == 6 and self.plist.count() > 0 and self.repeat_mode != 'none': self.play_next()
         d, cur = m.get_length(), m.get_time()
         if d > 0 and not self.sk.isSliderDown(): self.sk.setValue(int((cur/d)*1000))
         if d > 0: self.lbl_t.setText(f"{cur//60000}:{(cur//1000)%60:02} / {d//60000}:{(d//1000)%60:02}")

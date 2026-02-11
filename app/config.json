@@ -7,8 +7,8 @@
     "card_width": 255,
     "show_static": true,
     "show_video": true,
-    "volume": 80,
-    "sidebar_width": 301,
+    "volume": 100,
+    "sidebar_width": 280,
     "autohide_windowed": false,
     "nicknames": {},
     "playlist": []
