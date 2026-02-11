@@ -11,6 +11,11 @@ from app.ui.library import LibraryDelegate, get_h
 from app.util.logger import setup_app_logger
 from app.util.metadata_db import MetadataDB
 from app.util.tvmaze_api import TVMazeAPI
+try:
+    import inputs
+    INPUTS_AVAILABLE = True
+except ImportError:
+    INPUTS_AVAILABLE = False
 
 logger = setup_app_logger("MAIN_WINDOW")
 
@@ -559,6 +564,20 @@ class MainWindow(QMainWindow):
         # Player modes
         self.repeat_mode = 'none'  # none, one, all
         self.shuffle = False
+        # Controller support
+        if INPUTS_AVAILABLE:
+            try:
+                gamepads = inputs.devices.gamepads
+                if gamepads:
+                    self._controller_thread = threading.Thread(target=self._monitor_controller, daemon=True)
+                    self._controller_thread.start()
+                    logger.info("Controller monitoring started")
+                else:
+                    logger.info("No gamepads detected")
+            except Exception:
+                logger.exception("Failed to start controller monitoring")
+        else:
+            logger.info("Inputs library not available for controller support")
 
     def changeEvent(self, event):
         try:
@@ -600,6 +619,89 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("Error positioning resize handles")
         return super().resizeEvent(e)
+
+    def keyPressEvent(self, event):
+        try:
+            key = event.key()
+            if key == Qt.Key_Space or key == Qt.Key_MediaPlay or key == Qt.Key_MediaPause:
+                # Play/Pause
+                self.backend.main_player.pause()
+            elif key == Qt.Key_Left or key == Qt.Key_MediaPrevious:
+                # Seek backward 10s or previous track
+                if event.modifiers() & Qt.ControlModifier:
+                    # Ctrl+Left: previous track
+                    if self.plist.count() > 0:
+                        idx = (self.plist.currentRow() - 1) % self.plist.count()
+                        self.plist.setCurrentRow(idx)
+                        self.p_m(self.plist.currentItem().data(Qt.UserRole))
+                else:
+                    pos = self.backend.main_player.get_time() - 10000
+                    self.backend.main_player.set_time(max(0, pos))
+            elif key == Qt.Key_Right or key == Qt.Key_MediaNext:
+                # Seek forward 10s or next track
+                if event.modifiers() & Qt.ControlModifier:
+                    # Ctrl+Right: next track
+                    self.play_next()
+                else:
+                    pos = self.backend.main_player.get_time() + 10000
+                    length = self.backend.main_player.get_length()
+                    self.backend.main_player.set_time(min(length, pos))
+            elif key == Qt.Key_Up or key == Qt.Key_VolumeUp:
+                # Volume up
+                vol = min(100, self.cfg["volume"] + 5)
+                self.set_vol_save(vol)
+            elif key == Qt.Key_Down or key == Qt.Key_VolumeDown:
+                # Volume down
+                vol = max(0, self.cfg["volume"] - 5)
+                self.set_vol_save(vol)
+            elif key == Qt.Key_F:
+                # Toggle fullscreen
+                self.toggle_fs()
+            elif key == Qt.Key_Escape or key == Qt.Key_Back:
+                # Exit fullscreen or back
+                if self.isFullScreen():
+                    self.showNormal()
+                else:
+                    # Back navigation: perhaps hide sidebars or something
+                    pass
+            elif key == Qt.Key_N or key == Qt.Key_MediaNext:
+                # Next track
+                self.play_next()
+            elif key == Qt.Key_P or key == Qt.Key_MediaPrevious:
+                # Previous track
+                if self.plist.count() > 0:
+                    idx = (self.plist.currentRow() - 1) % self.plist.count()
+                    self.plist.setCurrentRow(idx)
+                    self.p_m(self.plist.currentItem().data(Qt.UserRole))
+            elif key == Qt.Key_R:
+                # Toggle repeat
+                self.toggle_repeat()
+            elif key == Qt.Key_S:
+                # Toggle shuffle
+                self.toggle_shuffle()
+            elif key == Qt.Key_M or key == Qt.Key_VolumeMute:
+                # Mute/unmute
+                if self.cfg["volume"] > 0:
+                    self._last_vol = self.cfg["volume"]
+                    self.set_vol_save(0)
+                else:
+                    self.set_vol_save(self._last_vol if hasattr(self, '_last_vol') else 50)
+            elif key == Qt.Key_Backspace:
+                # Back button
+                if self.isFullScreen():
+                    self.showNormal()
+                elif self.sb_l.isVisible():
+                    self.sb_l.hide()
+                elif self.sb_r.isVisible():
+                    self.sb_r.hide()
+                else:
+                    # Perhaps close or something
+                    pass
+            else:
+                super().keyPressEvent(event)
+        except Exception:
+            logger.exception("Error handling key press")
+            super().keyPressEvent(event)
 
     def on_split(self, pos, idx): 
         if idx == 1: self.cfg["sidebar_width"] = pos; config.save(self.cfg)
@@ -822,6 +924,49 @@ class MainWindow(QMainWindow):
                     except Exception:
                         logger.exception("Failed to request thumbnail for %s", p)
             it += 1
+    def toggle_repeat(self):
+        modes = ['none', 'one', 'all']
+        current_idx = modes.index(self.repeat_mode)
+        self.repeat_mode = modes[(current_idx + 1) % len(modes)]
+        self.bt_repeat.setText(f"Repeat {self.repeat_mode.title()}")
+
+    def _monitor_controller(self):
+        try:
+            while True:
+                events = inputs.get_gamepad()
+                for event in events:
+                    if event.state == 1:  # Button press
+                        if event.code == 'BTN_SOUTH':  # A / Cross
+                            self.backend.main_player.pause()
+                        elif event.code == 'BTN_EAST':  # B / Circle
+                            self.play_next()
+                        elif event.code == 'BTN_WEST':  # X / Square
+                            if self.plist.count() > 0:
+                                idx = (self.plist.currentRow() - 1) % self.plist.count()
+                                self.plist.setCurrentRow(idx)
+                                self.p_m(self.plist.currentItem().data(Qt.UserRole))
+                        elif event.code == 'BTN_NORTH':  # Y / Triangle
+                            self.toggle_fs()
+                        elif event.code == 'BTN_SELECT':  # Select
+                            self.toggle_repeat()
+                        elif event.code == 'BTN_START':  # Start
+                            self.toggle_shuffle()
+                        elif event.code == 'ABS_Y-':  # D-pad up
+                            vol = min(100, self.cfg["volume"] + 5)
+                            self.set_vol_save(vol)
+                        elif event.code == 'ABS_Y+':  # D-pad down
+                            vol = max(0, self.cfg["volume"] - 5)
+                            self.set_vol_save(vol)
+                        elif event.code == 'ABS_X-':  # D-pad left
+                            pos = self.backend.main_player.get_time() - 10000
+                            self.backend.main_player.set_time(max(0, pos))
+                        elif event.code == 'ABS_X+':  # D-pad right
+                            pos = self.backend.main_player.get_time() + 10000
+                            length = self.backend.main_player.get_length()
+                            self.backend.main_player.set_time(min(length, pos))
+        except Exception:
+            logger.exception("Controller monitoring error")
+
     def toggle_repeat(self):
         modes = ['none', 'one', 'all']
         current_idx = modes.index(self.repeat_mode)
