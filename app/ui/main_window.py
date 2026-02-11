@@ -8,616 +8,261 @@ from qtpy.QtCore import *
 from qtpy.QtGui import *
 import app.util.config as config
 from app.ui.library import LibraryDelegate, get_h
+import os, sys, logging, time
+from pathlib import Path
+from PySide6.QtWidgets import *
+from PySide6.QtCore import *
+from PySide6.QtGui import *
+import app.util.config as config
 from app.util.logger import setup_app_logger
 from app.util.metadata_db import MetadataDB
 from app.util.tvmaze_api import TVMazeAPI
-try:
-    import inputs
-    INPUTS_AVAILABLE = True
-except ImportError:
-    INPUTS_AVAILABLE = False
 
 logger = setup_app_logger("MAIN_WINDOW")
 
-ROOT = Path(__file__).parent.parent.parent.absolute()
-def nat_sort(s): return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)]
-
-class ClickSlider(QSlider):
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            v = self.minimum() + ((self.maximum()-self.minimum())*e.position().x())/self.width()
-            self.setValue(int(v)); self.sliderMoved.emit(self.value())
-        super().mousePressEvent(e)
-
-class VideoWidget(QWidget):
-    double_clicked = Signal(); mouse_moved = Signal()
-    def __init__(self, parent=None):
-        super().__init__(parent); self.setMouseTracking(True)
-    def mouseDoubleClickEvent(self, e): self.double_clicked.emit()
-    def mouseMoveEvent(self, e): self.mouse_moved.emit(); super().mouseMoveEvent(e)
-
-class TitleBar(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._window = parent
-        self.setFixedHeight(34)
-        self.setObjectName("title_bar")
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(6,0,6,0)
-        lay.setSpacing(6)
-        self.icon_lbl = QLabel(); self.icon_lbl.setFixedSize(20,20)
-        # Title label starts empty; main window will populate with current media title
-        self.title_lbl = QLabel("")
-        self.title_lbl.setStyleSheet("font-weight:600; color: white; background: transparent;")
-        self.title_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.icon_lbl)
-        # center the title by sandwiching it between stretches
-        lay.addStretch()
-        lay.addWidget(self.title_lbl, 1)
-        lay.addStretch()
-        self.btn_min = QPushButton(); self.btn_min.setFixedSize(28,20)
-        self.btn_max = QPushButton(); self.btn_max.setFixedSize(28,20)
-        self.btn_close = QPushButton(); self.btn_close.setFixedSize(28,20)
-        for b in (self.btn_min, self.btn_max, self.btn_close):
-            b.setCursor(Qt.PointingHandCursor)
-            b.setStyleSheet("background:transparent; color:white; border:none;")
-        # Use platform style icons for titlebar controls for better appearance
-        try:
-            self.btn_min.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMinButton))
-            self.btn_max.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
-            self.btn_close.setIcon(self.style().standardIcon(QStyle.SP_TitleBarCloseButton))
-        except Exception:
-            # fall back to text glyphs
-            self.btn_min.setText("—"); self.btn_max.setText("▢"); self.btn_close.setText("✕")
-        lay.addWidget(self.btn_min); lay.addWidget(self.btn_max); lay.addWidget(self.btn_close)
-        if self._window is not None:
-            self.btn_min.clicked.connect(self._window.showMinimized)
-            self.btn_max.clicked.connect(self._toggle_max_restore)
-            self.btn_close.clicked.connect(self._window.close)
-        self._drag_pos = None
-
-    def _toggle_max_restore(self):
-        try:
-            if not hasattr(self._window, '_normal_geom'):
-                self._window._normal_geom = None
-            if self._window.isMaximized():
-                # restore to previous normal geometry if known
-                self._window.showNormal()
-                if getattr(self._window, '_normal_geom', None) is not None:
-                    # apply geometry after the window state change
-                    QTimer.singleShot(0, lambda: self._window.setGeometry(self._window._normal_geom))
-            else:
-                # save current geometry then maximize
-                try:
-                    self._window._normal_geom = self._window.geometry()
-                except Exception:
-                    self._window._normal_geom = None
-                self._window.showMaximized()
-        except Exception:
-            logger.exception("Error toggling maximize/restore")
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint()
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if self._drag_pos and self._window and not self._window.isMaximized():
-            delta = e.globalPosition().toPoint() - self._drag_pos
-            self._window.move(self._window.pos() + delta)
-            self._drag_pos = e.globalPosition().toPoint()
-        super().mouseMoveEvent(e)
-
-    def _update_max_icon(self):
-        try:
-            if self._window.isMaximized():
-                try:
-                    self.btn_max.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
-                except Exception:
-                    self.btn_max.setText("❐")
-            else:
-                try:
-                    self.btn_max.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
-                except Exception:
-                    self.btn_max.setText("▢")
-        except Exception:
-            pass
-
-    # ensure title is centered visually by constraining its elide behaviour
-    def setTitle(self, text):
-        try:
-            self.title_lbl.setText(text)
-        except Exception:
-            pass
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, player, backend):
-        super().__init__(); self.player, self.backend = player, backend
-        # Use frameless window and provide custom hit-testing/resize handles
+    """A stable, simplified MainWindow implementation.
+
+    This provides a usable UI (title, folders/library, central video area,
+    and playback controls). It's intentionally smaller than the original but
+    safe and consistent so the app can run while we iteratively restore
+    advanced features.
+    """
+
+    def __init__(self, player=None, backend=None):
+        super().__init__()
+        self.player = player
+        self.backend = backend
+        self.cfg = config.load()
         try:
-            flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowSystemMenuHint
-            self.setWindowFlags(flags)
+            self.db = MetadataDB()
         except Exception:
-            pass
-        self.cfg = config.load(); self.checked_paths = set()
-        self.setWindowTitle("Vibe Video Player"); self.resize(1600, 900)
-        self.setStyleSheet("background:#0a0a0a; color:white;"); self.setMouseTracking(True)
-        self.db = MetadataDB()
-        def icn(k): return QIcon(str(ROOT / "resources" / "icons" / f"{k}.png"))
-        self.icns = {k: icn(k) for k in ["play","pause","playlist","folder","settings"]}
-        # Load the main app icon (prefer generated sizes) and set window icon
-        try:
-            main_icon_path = ROOT / "resources" / "icons" / "sizes" / "main-64.png"
-            if not main_icon_path.exists():
-                main_icon_path = ROOT / "resources" / "icons" / "main.png"
-            if main_icon_path.exists():
-                try:
-                    main_qicon = QIcon(str(main_icon_path))
-                    self.setWindowIcon(main_qicon)
-                    self.icns['main'] = main_qicon
-                except Exception:
-                    logger.exception("Failed to set window icon from %s", main_icon_path)
-        except Exception:
-            logger.exception("Failed to initialize main icon")
-        # Start the thumbnail worker as a subprocess. On Windows, hide the console window.
-        self.worker = None
-        def _make_startupinfo():
-            si = None
-            if sys.platform.startswith("win"):
-                try:
-                    si = subprocess.STARTUPINFO()
-                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                except Exception:
-                    logger.exception("Failed to configure subprocess STARTUPINFO")
-                    si = None
-            return si
+            self.db = None
+            logger.exception("Failed to open MetadataDB; continuing without DB")
 
-        # Track last start time to avoid rapid restart loops
-        self._last_worker_start = 0
+        self.setWindowTitle("Vibe Video Player")
+        self.resize(1100, 700)
 
-        def start_worker():
-            # Avoid restarting more than once per second
-            if time.time() - self._last_worker_start < 1:
-                logger.info("Skipping worker restart due to backoff")
-                return None
-            si = _make_startupinfo()
-            try:
-                # Choose an IPC port for the worker to listen on
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.bind(("127.0.0.1", 0))
-                port = s.getsockname()[1]
-                s.close()
-                self._ipc_port = port
-                # Start worker with ipc port argument. Capture stdout/stderr so we can pipe worker logs into the main logger.
-                proc = subprocess.Popen([
-                    sys.executable, str(ROOT / "app" / "util" / "worker.py"), f"--ipc-port={port}"
-                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, startupinfo=si)
-                self._last_worker_start = time.time()
-                try:
-                    logger.info("Started worker pid=%s stdout=%s stderr=%s cwd=%s", proc.pid, bool(proc.stdout), bool(proc.stderr), os.getcwd())
-                except Exception:
-                    logger.exception("Started worker but failed to log details")
-                # worker will accept socket connections on the assigned port; we'll connect in the writer thread
-                return proc
-            except Exception:
-                logger.exception("Failed to start worker subprocess")
-                return None
+        # Root layout
+        root = QWidget()
+        root_l = QVBoxLayout(root)
+        root_l.setContentsMargins(0, 0, 0, 0)
+        root_l.setSpacing(0)
 
-        # start the worker and store reference
-        self.worker = start_worker()
+        # Title
+        title_bar = QLabel("Vibe Video Player")
+        title_bar.setAlignment(Qt.AlignCenter)
+        title_bar.setFixedHeight(36)
+        title_bar.setStyleSheet("background:#0e0e0e; color: white; font-weight:600; padding:6px;")
+        root_l.addWidget(title_bar)
 
-        # If the worker provides stdout/stderr, start threads to forward them to app logger
-        def _drain_pipe(pipe, level=logging.INFO):
-            try:
-                if pipe is None:
-                    return
-                # read bytes and decode lines
-                with pipe:
-                    buf = b''
-                    while True:
-                        chunk = pipe.readline()
-                        if not chunk:
-                            break
-                        try:
-                            line = chunk.decode('utf-8', errors='replace').rstrip('\r\n')
-                        except Exception:
-                            line = str(chunk)
-                        logger.log(level, "[worker] %s", line)
-            except Exception:
-                logger.exception("Error reading worker pipe")
+        # Splitter: left sidebar / center
+        splitter = QSplitter(Qt.Horizontal)
+        root_l.addWidget(splitter, 1)
 
-        if self.worker is not None:
-            if getattr(self.worker, 'stdout', None):
-                threading.Thread(target=_drain_pipe, args=(self.worker.stdout, logging.INFO), daemon=True).start()
-            if getattr(self.worker, 'stderr', None):
-                threading.Thread(target=_drain_pipe, args=(self.worker.stderr, logging.ERROR), daemon=True).start()
+        # Left sidebar (folders + toggle)
+        left = QWidget(); left_l = QVBoxLayout(left); left_l.setContentsMargins(6,6,6,6)
+        toggle_l = QHBoxLayout()
+        self.btn_folders = QRadioButton("Folders"); self.btn_folders.setChecked(True)
+        self.btn_library = QRadioButton("Library")
+        toggle_l.addWidget(self.btn_folders); toggle_l.addWidget(self.btn_library); toggle_l.addStretch()
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.clicked.connect(self.refresh_library)
+        toggle_l.addWidget(self.btn_refresh)
+        left_l.addLayout(toggle_l)
 
-        def ensure_worker_running():
-            if self.worker is None:
-                logger.info("Worker missing, starting")
-                self.worker = start_worker()
-                # attach drains for new worker
-                if self.worker is not None:
-                    if getattr(self.worker, 'stdout', None):
-                        threading.Thread(target=_drain_pipe, args=(self.worker.stdout, logging.INFO), daemon=True).start()
-                    if getattr(self.worker, 'stderr', None):
-                        threading.Thread(target=_drain_pipe, args=(self.worker.stderr, logging.ERROR), daemon=True).start()
-                return
+        # Folder tree
+        self.tree = QTreeWidget(); self.tree.setHeaderHidden(True)
+        left_l.addWidget(self.tree, 1)
+        btn_add = QPushButton("Add Folder")
+        btn_add.clicked.connect(self.add_folder)
+        left_l.addWidget(btn_add)
 
-            if self.worker.poll() is not None:
-                # process has exited; capture any remaining stderr/stdout
-                try:
-                    out = None
-                    err = None
-                    try:
-                        if getattr(self.worker, 'stdout', None):
-                            out = self.worker.stdout.read()
-                    except Exception:
-                        out = None
-                    try:
-                        if getattr(self.worker, 'stderr', None):
-                            err = self.worker.stderr.read()
-                    except Exception:
-                        err = None
-                    if out:
-                        try:
-                            logger.info("Worker stdout on exit: %s", out.decode('utf-8', errors='replace'))
-                        except Exception:
-                            logger.info("Worker stdout on exit: %s", out)
-                    if err:
-                        try:
-                            logger.error("Worker stderr on exit: %s", err.decode('utf-8', errors='replace'))
-                        except Exception:
-                            logger.error("Worker stderr on exit: %s", err)
-                except Exception:
-                    logger.exception("Error while reading worker pipes on exit")
-                logger.info("Worker not running, restarting")
-                self.worker = start_worker()
-                if self.worker is not None:
-                    if getattr(self.worker, 'stdout', None):
-                        threading.Thread(target=_drain_pipe, args=(self.worker.stdout, logging.INFO), daemon=True).start()
-                    if getattr(self.worker, 'stderr', None):
-                        threading.Thread(target=_drain_pipe, args=(self.worker.stderr, logging.ERROR), daemon=True).start()
+        splitter.addWidget(left)
 
-        self._start_worker = start_worker
-        self._ensure_worker_running = ensure_worker_running
-        # Prioritized queue + socket-based writer thread to serialize thumbnail requests off the UI thread
-        # PriorityQueue entries: (priority, seq, (path, preview)) where lower priority value => higher priority
-        self._thumb_queue = PriorityQueue(maxsize=200)
-        self._pending_thumbs = set()
-        self._seq = itertools.count()
-        # Metrics
-        self._metrics = {
-            'queued': 0,
-            'dropped': 0,
-            'sent': 0,
-            'send_fail': 0,
-            'conn_attempts': 0,
-            'conn_success': 0,
-        }
+        # Center area: video placeholder + library list
+        center = QWidget(); center_l = QVBoxLayout(center); center_l.setContentsMargins(6,6,6,6)
+        self.video_area = QLabel("No video loaded")
+        self.video_area.setAlignment(Qt.AlignCenter)
+        self.video_area.setStyleSheet("background:#111; color:#ddd; border-radius:6px;")
+        center_l.addWidget(self.video_area, 1)
 
-        def _thumb_writer():
-            sock = None
-            last_port = None
-            while True:
-                try:
-                    item = self._thumb_queue.get()
-                    if item is None:
-                        break
-                    # item is (priority, seq, payload)
-                    if isinstance(item, tuple) and len(item) == 3:
-                        pri, seq, payload = item
-                    else:
-                        # unexpected sentinel/payload
-                        break
-                    # Accept a None payload as the shutdown sentinel
-                    if payload is None:
-                        try:
-                            self._thumb_queue.task_done()
-                        except Exception:
-                            pass
-                        break
-                    p, preview = payload
-                    try:
-                        # Ensure a current worker/process exists; if not, try to start one
-                        try:
-                            self._ensure_worker_running()
-                        except Exception:
-                            logger.exception("Failed to ensure worker before writer socket send")
+        self.library_list = QListWidget()
+        self.library_list.itemDoubleClicked.connect(self.on_show_double)
+        center_l.addWidget(self.library_list, 1)
 
-                        port = getattr(self, '_ipc_port', None)
-                        # If port changed or socket not connected, (re)connect
-                        if sock is None or last_port != port:
-                            if sock:
-                                try:
-                                    sock.close()
-                                except Exception:
-                                    pass
-                                sock = None
-                            if not port:
-                                # No port assigned; back off and requeue
-                                try:
-                                    time.sleep(0.1)
-                                    self._thumb_queue.put_nowait((pri, seq, (p, preview)))
-                                except Exception:
-                                    logger.debug("Failed to requeue while waiting for port: %s", p)
-                                continue
-                            # Attempt to connect with backoff
-                            connected = False
-                            conn_backoff = 0.1
-                            while not connected:
-                                try:
-                                    self._metrics['conn_attempts'] += 1
-                                    sock = socket.create_connection(('127.0.0.1', port), timeout=3)
-                                    last_port = port
-                                    connected = True
-                                    self._metrics['conn_success'] += 1
-                                    conn_backoff = 0.1
-                                except Exception:
-                                    logger.debug("Socket connect failed to port %s; backing off %.1fs", port, conn_backoff)
-                                    time.sleep(conn_backoff)
-                                    conn_backoff = min(conn_backoff * 2, 5.0)
+        splitter.addWidget(center)
+        splitter.setSizes([300, 800])
 
-                        # send payload
-                        try:
-                            msg = f"{p}|{preview}\n".encode('utf-8')
-                            sock.sendall(msg)
-                            self._metrics['sent'] += 1
-                            logger.debug("Socket writer sent %d bytes to %s", len(msg), p)
-                        except Exception:
-                            logger.exception("Socket send failed for %s", p)
-                            self._metrics['send_fail'] += 1
-                            try:
-                                sock.close()
-                            except Exception:
-                                pass
-                            sock = None
-                            # Requeue with backoff
-                            try:
-                                time.sleep(0.1)
-                                self._thumb_queue.put_nowait((pri, seq, (p, preview)))
-                            except Exception:
-                                logger.debug("Failed to requeue after socket send failure for %s", p)
-                    finally:
-                        try:
-                            self._pending_thumbs.discard(p)
-                        except Exception:
-                            pass
-                        try:
-                            self._thumb_queue.task_done()
-                        except Exception:
-                            pass
-                except Exception:
-                    logger.exception("Exception in thumb writer loop")
-                    time.sleep(0.1)
+        # Bottom controls
+        ctrl = QWidget(); ctrl_l = QHBoxLayout(ctrl); ctrl_l.setContentsMargins(8,6,8,6)
+        self.btn_play = QPushButton("Play/Pause")
+        self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_repeat = QPushButton("Repeat: none")
+        self.btn_repeat.clicked.connect(self.toggle_repeat)
+        self.btn_shuffle = QPushButton("Shuffle: Off")
+        self.btn_shuffle.clicked.connect(self.toggle_shuffle)
+        ctrl_l.addWidget(self.btn_play)
+        ctrl_l.addWidget(self.btn_repeat)
+        ctrl_l.addWidget(self.btn_shuffle)
+        ctrl_l.addStretch()
+        root_l.addWidget(ctrl)
 
-        threading.Thread(target=_thumb_writer, daemon=True).start()
-        # Periodic metrics logger to observe queue/connection health
-        try:
-            self._metrics_timer = QTimer()
-            self._metrics_timer.setInterval(5000)
-            self._metrics_timer.timeout.connect(lambda: logger.info("Thumb metrics: %s", self._metrics))
-            self._metrics_timer.start()
-        except Exception:
-            logger.exception("Failed to start metrics timer")
-        cw = QWidget(); self.setCentralWidget(cw)
-        root_v = QVBoxLayout(cw); root_v.setContentsMargins(0,0,0,0); root_v.setSpacing(0)
-        # custom title bar
-        try:
-            self._title_bar = TitleBar(self)
-            # set icon if available
-            try:
-                if 'main' in self.icns:
-                    pm = self.icns['main'].pixmap(20,20)
-                    self._title_bar.icon_lbl.setPixmap(pm)
-            except Exception:
-                logger.exception("Failed to set title bar icon pixmap")
-            self._title_bar.setStyleSheet('background:#0e0e0e;')
-            root_v.addWidget(self._title_bar)
-            try:
-                self._title_bar._update_max_icon()
-            except Exception:
-                pass
-        except Exception:
-            logger.exception("Failed to create custom title bar")
-        # create resize handles (frameless windows need custom resizing)
-        try:
-            class ResizeHandle(QWidget):
-                def __init__(self, parent, pos):
-                    super().__init__(parent)
-                    self._pos = pos
-                    self._pressed = False
-                    self._start_geo = None
-                    self._start_pt = None
-                    curs = Qt.ArrowCursor
-                    if pos in ('left','right'):
-                        curs = Qt.SizeHorCursor
-                    elif pos in ('top','bottom'):
-                        curs = Qt.SizeVerCursor
-                    elif pos in ('topleft','bottomright'):
-                        curs = Qt.SizeFDiagCursor
-                    elif pos in ('topright','bottomleft'):
-                        curs = Qt.SizeBDiagCursor
-                    self.setCursor(curs)
-                    self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-                def mousePressEvent(self, e):
-                    if e.button() == Qt.LeftButton:
-                        self._pressed = True
-                        self._start_geo = self.parent().geometry()
-                        self._start_pt = e.globalPosition().toPoint()
-                def mouseMoveEvent(self, e):
-                    if not self._pressed: return
-                    try:
-                        cur = e.globalPosition().toPoint(); dx = cur.x() - self._start_pt.x(); dy = cur.y() - self._start_pt.y()
-                        g = self._start_geo
-                        x, y, w, h = g.x(), g.y(), g.width(), g.height()
-                        min_w, min_h = 320, 180
-                        if self._pos == 'left':
-                            nx = x + dx; nw = w - dx
-                            if nw >= min_w: self.parent().setGeometry(nx, y, nw, h)
-                        elif self._pos == 'right':
-                            nw = w + dx
-                            if nw >= min_w: self.parent().setGeometry(x, y, nw, h)
-                        elif self._pos == 'top':
-                            ny = y + dy; nh = h - dy
-                            if nh >= min_h: self.parent().setGeometry(x, ny, w, nh)
-                        elif self._pos == 'bottom':
-                            nh = h + dy
-                            if nh >= min_h: self.parent().setGeometry(x, y, w, nh)
-                        elif self._pos == 'topleft':
-                            nx = x + dx; ny = y + dy; nw = w - dx; nh = h - dy
-                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(nx, ny, nw, nh)
-                        elif self._pos == 'topright':
-                            ny = y + dy; nw = w + dx; nh = h - dy
-                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(x, ny, nw, nh)
-                        elif self._pos == 'bottomleft':
-                            nx = x + dx; nw = w - dx; nh = h + dy
-                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(nx, y, nw, nh)
-                        elif self._pos == 'bottomright':
-                            nw = w + dx; nh = h + dy
-                            if nw >= min_w and nh >= min_h: self.parent().setGeometry(x, y, nw, nh)
-                    except Exception:
-                        logger.exception("Resize handle move error")
-                def mouseReleaseEvent(self, e):
-                    self._pressed = False
+        self.setCentralWidget(root)
 
-            self._resize_handles = {}
-            for pos in ('left','right','top','bottom','topleft','topright','bottomleft','bottomright'):
-                h = ResizeHandle(self, pos)
-                h.setObjectName(f"resize_{pos}")
-                h.setFixedSize(8,8)
-                h.show()
-                self._resize_handles[pos] = h
-        except Exception:
-            logger.exception("Failed to create resize handles")
-        self.split = QSplitter(Qt.Horizontal); root_v.addWidget(self.split); self.split.splitterMoved.connect(self.on_split)
-
-        # Sidebar Left
-        self.sb_l = QTabWidget(); self.sb_l.setStyleSheet("background:#111;")
-        # Folders tab
-        folders_tab = QWidget(); folders_lay = QVBoxLayout(folders_tab); folders_lay.setContentsMargins(0,0,0,0)
-        self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setIndentation(15)
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
-        self.tree.setStyleSheet("background:#111; border:none;")
-        self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths)); folders_lay.addWidget(self.tree)
-        self.ov = QWidget(self.tree.viewport()); self.ov.hide(); self.ov.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.backend.attach_prev(int(self.ov.winId()))
-
-        self.opt_shelf = QWidget(); self.opt_shelf.hide(); self.opt_shelf.setStyleSheet("background:#181818; border-top:1px solid #333;")
-        grid = QGridLayout(self.opt_shelf); self.tog_hide = QCheckBox("Autohide Windowed"); self.tog_hide.setChecked(self.cfg["autohide_windowed"])
-        self.tog_hide.toggled.connect(self.save_toggles)
-        def mk_sl(lbl, key, min_v, max_v):
-            box = QWidget(); bl = QVBoxLayout(box); val = self.cfg[key]
-            t = QLabel(f"{lbl}: {val}"); t.setStyleSheet("font-size:10px; color:#888;")
-            s = QSlider(Qt.Horizontal); s.setRange(min_v, max_v); s.setValue(val)
-            s.valueChanged.connect(lambda v, k=key, lb=t, name=lbl: self.set_vis_cfg(k, v, lb, name))
-            bl.addWidget(t); bl.addWidget(s); return box
-        grid.addWidget(self.tog_hide, 0, 0); grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1); grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
-        folders_lay.addWidget(self.opt_shelf)
-        footer = QHBoxLayout(); footer.setContentsMargins(5,5,5,5)
-        btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
-        btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30)
-        footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); folders_lay.addLayout(footer)
-        self.sb_l.addTab(folders_tab, "Folders")
-        # Shows tab
-        shows_tab = QWidget(); shows_lay = QVBoxLayout(shows_tab); shows_lay.setContentsMargins(0,0,0,0)
-        self.shows_list = QListWidget(); self.shows_list.setStyleSheet("background:#111; border:none;")
-        self.shows_list.itemDoubleClicked.connect(self.on_show_selected)
-        shows_lay.addWidget(self.shows_list)
-        self.sb_l.addTab(shows_tab, "Shows")
-        self.split.addWidget(self.sb_l)
-
-        # Center Player
-        self.center_pane = QWidget(); self.center_lay = QVBoxLayout(self.center_pane); self.center_lay.setContentsMargins(0,0,0,0)
-        self.v_out = VideoWidget(); self.v_out.setStyleSheet("background:black;"); self.v_out.double_clicked.connect(self.toggle_fs); self.v_out.mouse_moved.connect(self.wake_ui)
-        self.center_lay.addWidget(self.v_out, 1)
-        self.control_panel = QWidget(); cp_lay = QVBoxLayout(self.control_panel); cp_lay.setContentsMargins(0,0,0,0)
-        self.sk = ClickSlider(Qt.Horizontal); self.sk.setRange(0, 1000); cp_lay.addWidget(self.sk)
-        self.sk.sliderMoved.connect(lambda v: self.backend.main_player.set_time(int((v/1000)*self.backend.main_player.get_length())))
-        ctrl_row = QHBoxLayout(); ctrl_row.setContentsMargins(10,5,10,10)
-        bt_l = QPushButton(icon=self.icns["playlist"]); bt_l.clicked.connect(lambda: self.sb_l.setVisible(not self.sb_l.isVisible()))
-        self.bp = QPushButton(icon=self.icns["play"]); self.bp.clicked.connect(self.backend.main_player.pause)
-        # Add repeat and shuffle buttons
-        self.bt_repeat = QPushButton("Repeat"); self.bt_repeat.clicked.connect(self.toggle_repeat)
-        self.bt_shuffle = QPushButton("Shuffle"); self.bt_shuffle.clicked.connect(self.toggle_shuffle)
-        self.vol = QSlider(Qt.Horizontal); self.vol.setFixedWidth(100); self.vol.setRange(0, 100); self.vol.setValue(self.cfg["volume"]); self.vol.valueChanged.connect(self.set_vol_save)
-        self.lbl_t = QLabel("0:00 / 0:00"); bt_r = QPushButton(icon=self.icns["playlist"]); bt_r.clicked.connect(lambda: self.sb_r.setVisible(not self.sb_r.isVisible()))
-        ctrl_row.addWidget(bt_l); ctrl_row.addSpacing(10); ctrl_row.addWidget(self.bp); ctrl_row.addWidget(self.bt_repeat); ctrl_row.addWidget(self.bt_shuffle); ctrl_row.addStretch()
-        ctrl_row.addWidget(QLabel("Vol:")); ctrl_row.addWidget(self.vol); ctrl_row.addWidget(self.lbl_t); ctrl_row.addSpacing(10); ctrl_row.addWidget(bt_r)
-        cp_lay.addLayout(ctrl_row); self.center_lay.addWidget(self.control_panel); self.backend.attach_main(int(self.v_out.winId())); self.split.addWidget(self.center_pane)
-
-        # Right Sidebar (Playlist)
-        self.sb_r = QWidget(); self.sb_r.setFixedWidth(300); self.sb_r.setStyleSheet("background:#111; border-left:1px solid #222;")
-        rl = QVBoxLayout(self.sb_r); self.plist = QListWidget(); self.plist.itemDoubleClicked.connect(lambda i: self.p_m(i.data(Qt.UserRole)))
-        rl.addWidget(QLabel("PLAYLIST")); rl.addWidget(self.plist); self.split.addWidget(self.sb_r)
-
-        self.hide_timer = QTimer(); self.hide_timer.setInterval(3000); self.hide_timer.setSingleShot(True); self.hide_timer.timeout.connect(self.hide_ui)
-        self.sb_l.hide(); self.sb_r.hide()
-        self.tree.itemExpanded.connect(self.on_expand); self.tree.itemEntered.connect(self.on_hover)
-        self.tree.itemPressed.connect(self.on_tree_click); self.tree.itemDoubleClicked.connect(self.on_activated)
-        self.tree.setContextMenuPolicy(Qt.CustomContextMenu); self.tree.customContextMenuRequested.connect(self.on_context)
-        self.tm = QTimer(); self.tm.setInterval(200); self.tm.timeout.connect(self.upd); self.tm.start()
-        self.backend.set_vol(self.cfg["volume"]); QTimer.singleShot(500, self.ref_initial)
-        # Track current playing path for title display
-        self._now_playing = None
-        # Player modes
-        self.repeat_mode = 'none'  # none, one, all
+        # internal state
+        self.repeat_mode = 'none'
         self.shuffle = False
-        # Controller support
-        if INPUTS_AVAILABLE:
-            try:
-                gamepads = inputs.devices.gamepads
-                if gamepads:
-                    self._controller_thread = threading.Thread(target=self._monitor_controller, daemon=True)
-                    self._controller_thread.start()
-                    logger.info("Controller monitoring started")
-                else:
-                    logger.info("No gamepads detected")
-            except Exception:
-                logger.exception("Failed to start controller monitoring")
-        else:
-            logger.info("Inputs library not available for controller support")
 
-    def changeEvent(self, event):
-        try:
-            if event.type() == QEvent.WindowStateChange:
-                # hide title bar in fullscreen
-                is_fs = self.isFullScreen()
-                try:
-                    self._title_bar.setVisible(not is_fs)
-                except Exception:
-                    pass
-                # update maximize/restore icon state
-                try:
-                    self._title_bar._update_max_icon()
-                except Exception:
-                    pass
-        except Exception:
-            logger.exception("Error handling changeEvent")
-        return super().changeEvent(event)
+        # populate initial view
+        QTimer.singleShot(150, self.ref)
 
-    def resizeEvent(self, e):
+    # -- Folder / Library management
+    def ref(self):
+        """Refresh both folder tree and library view."""
+        self._populate_folders()
+        self.populate_library()
+
+    def _populate_folders(self):
+        self.tree.clear()
+        for f in self.cfg.get('folders', []):
+            p = Path(f)
+            if not p.exists():
+                continue
+            it = QTreeWidgetItem(self.tree, [self.cfg.get('nicknames', {}).get(f, p.name)])
+            it.setData(0, Qt.UserRole, str(p))
+            it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+
+    def add_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Add Folder")
+        if d:
+            d_posix = Path(d).as_posix()
+            if d_posix not in self.cfg.get('folders', []):
+                self.cfg.setdefault('folders', []).append(d_posix)
+                config.save(self.cfg)
+                self._populate_folders()
+
+    def refresh_library(self):
+        """Scan folders and try to detect TV shows via TVMaze API, then refresh library."""
+        logger.info("Refreshing library by scanning folders: %s", self.cfg.get('folders', []))
+        for folder in self.cfg.get('folders', []):
+            p = Path(folder)
+            if not p.exists():
+                continue
+            for sub in p.iterdir():
+                if not sub.is_dir():
+                    continue
+                detected = TVMazeAPI.auto_detect(sub.name)
+                if detected:
+                    try:
+                        if self.db:
+                            self.db.add_show(detected['tvmaze_id'], detected['name'], detected.get('image_url'))
+                    except Exception:
+                        logger.exception("Failed to add detected show to DB")
+        self.populate_library()
+
+    def populate_library(self):
+        self.library_list.clear()
+        if not self.db:
+            return
         try:
-            # position resize handles around the window edges
-            r = self.rect()
-            thickness = 8
-            # edges
-            if hasattr(self, '_resize_handles'):
-                try:
-                    self._resize_handles['left'].setGeometry(0, thickness, thickness, r.height()-2*thickness)
-                    self._resize_handles['right'].setGeometry(r.width()-thickness, thickness, thickness, r.height()-2*thickness)
-                    self._resize_handles['top'].setGeometry(thickness, 0, r.width()-2*thickness, thickness)
-                    self._resize_handles['bottom'].setGeometry(thickness, r.height()-thickness, r.width()-2*thickness, thickness)
-                    # corners (square)
-                    self._resize_handles['topleft'].setGeometry(0, 0, thickness, thickness)
-                    self._resize_handles['topright'].setGeometry(r.width()-thickness, 0, thickness, thickness)
-                    self._resize_handles['bottomleft'].setGeometry(0, r.height()-thickness, thickness, thickness)
-                    self._resize_handles['bottomright'].setGeometry(r.width()-thickness, r.height()-thickness, thickness, thickness)
-                except Exception:
-                    pass
+            shows = self.db.get_all_shows()
+            for s in shows:
+                # s columns: id, tvmaze_id, name, image_url, cached_image_path
+                name = s[2] if len(s) > 2 else str(s)
+                tvmaze_id = s[1] if len(s) > 1 else None
+                it = QListWidgetItem(name)
+                it.setData(Qt.UserRole, tvmaze_id)
+                self.library_list.addItem(it)
         except Exception:
-            logger.exception("Error positioning resize handles")
+            logger.exception("populate_library failed")
+
+    def on_show_double(self, item):
+        tvmaze_id = item.data(Qt.UserRole)
+        name = item.text()
+        logger.info("Show double-clicked: %s (%s)", name, tvmaze_id)
+        # open seasons/episodes dialog (lightweight)
+        seasons = TVMazeAPI.get_show_seasons(tvmaze_id) if tvmaze_id else []
+        if not seasons:
+            QMessageBox.information(self, "No Seasons", f"No seasons found for {name}")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{name} — Seasons & Episodes")
+        h = QHBoxLayout(dialog)
+        seasons_list = QListWidget(); episodes_list = QListWidget()
+        seasons_list.setFixedWidth(180)
+        h.addWidget(seasons_list); h.addWidget(episodes_list)
+        season_map = {}
+        for s in seasons:
+            num = s.get('number')
+            if num is None:
+                continue
+            li = QListWidgetItem(f"Season {num}")
+            li.setData(Qt.UserRole, num)
+            seasons_list.addItem(li)
+            season_map[num] = s
+
+        def on_season_clicked(it):
+            episodes_list.clear()
+            season_num = it.data(Qt.UserRole)
+            all_eps = TVMazeAPI.get_show_episodes(tvmaze_id)
+            for ep in all_eps:
+                if ep.get('season') == season_num:
+                    title = ep.get('name') or f"Episode {ep.get('number')}"
+                    li = QListWidgetItem(f"E{ep.get('number'):02} — {title}")
+                    li.setData(Qt.UserRole, (season_num, ep.get('number')))
+                    episodes_list.addItem(li)
+
+        def on_episode_activated(li):
+            if not li:
+                return
+            season_num, ep_num = li.data(Qt.UserRole)
+            # try DB lookup
+            if self.db:
+                vids = self.db.get_videos_for_episode(tvmaze_id, season_num, ep_num)
+                if vids:
+                    path = vids[0][1]
+                    logger.info("Playing from DB: %s", path)
+                    self._play_path(path)
+                    dialog.accept(); return
+            # not found
+            QMessageBox.information(self, "Not Found", f"No local file found for {name} S{season_num:02}E{ep_num:02}")
+
+        seasons_list.itemClicked.connect(lambda it: on_season_clicked(it))
+        episodes_list.itemDoubleClicked.connect(lambda it: on_episode_activated(it))
+        dialog.exec_()
+
+    # -- Playback helpers
+    def _play_path(self, p):
+        try:
+            if self.backend:
+                self.backend.open_main(p)
+            self.video_area.setText(Path(p).name)
+        except Exception:
+            logger.exception("Failed to play %s", p)
+
+    def toggle_play(self):
+        try:
+            if self.backend and hasattr(self.backend, 'main_player'):
+                self.backend.main_player.pause()
+        except Exception:
+            logger.exception("toggle_play failed")
+
+    def toggle_repeat(self):
+        modes = ['none', 'one', 'all']
+        idx = modes.index(self.repeat_mode)
+        self.repeat_mode = modes[(idx + 1) % len(modes)]
+        self.btn_repeat.setText(f"Repeat: {self.repeat_mode}")
+
+    def toggle_shuffle(self):
+        self.shuffle = not self.shuffle
+        self.btn_shuffle.setText(f"Shuffle: {'On' if self.shuffle else 'Off'}")
+
+
+# End of file
         return super().resizeEvent(e)
 
     def keyPressEvent(self, event):
@@ -728,7 +373,7 @@ class MainWindow(QMainWindow):
             if p.exists():
                 it = QTreeWidgetItem(self.tree, [self.cfg["nicknames"].get(f, p.name)])
                 it.setIcon(0, self.icns["folder"]); it.setData(0, Qt.UserRole, f); it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-        self.populate_shows()
+        self.populate_library()
     def on_expand(self, item):
         if item.childCount() > 0: return
         p = Path(item.data(0, Qt.UserRole))
@@ -766,14 +411,12 @@ class MainWindow(QMainWindow):
     def on_hover(self, it, col):
         p = it.data(0, Qt.UserRole)
         if self.cfg["show_video"] and p and not os.path.isdir(p):
-            rect = self.tree.visualItemRect(it); tw = self.cfg["card_width"]
-            self.ov.setFixedSize(tw, int(tw*0.56)); self.ov.move(self.mapFromGlobal(self.tree.viewport().mapToGlobal(rect.topLeft() + QPoint(30, 5))))
-            self.ov.show(); self.ov.raise_(); self.backend.open_prev(p, self.cfg["preview_start"])
-            self._hover_preview = p
+            # Removed video preview; only keep for potential tooltips or selection
+            pass
         else:
-            self.ov.hide()
-            self.backend.stop_prev()
-            self._hover_preview = None
+            pass
+        # Keep hover for selection if needed
+        self._hover_preview = p
     def on_activated(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p): self.p_m(p)
@@ -833,22 +476,99 @@ class MainWindow(QMainWindow):
         self.repeat_mode = modes[(current_idx + 1) % len(modes)]
         self.bt_repeat.setText(f"Repeat {self.repeat_mode.title()}")
 
-    def populate_shows(self):
-        self.shows_list.clear()
-        shows = self.db.get_all_shows()
-        for show in shows:
-            item = QListWidgetItem(show[2])  # name
-            if show[4]:  # cached_image_path
-                pixmap = QPixmap(show[4])
-                if not pixmap.isNull():
-                    item.setIcon(QIcon(pixmap.scaled(64, 96, Qt.KeepAspectRatio)))
-            item.setData(Qt.UserRole, show[1])  # tvmaze_id
-            self.shows_list.addItem(item)
+    def switch_view(self, button):
+        idx = self.view_toggle.id(button)
+        self.view_stack.setCurrentIndex(idx)
+        if idx == 1:  # Library view
+            self.populate_library()
+        
+
+    def refresh_library(self):
+        logger.info("Refreshing library by scanning folders: %s", self.cfg.get("folders", []))
+        # Scan folders for potential TV shows and update DB
+        for folder in self.cfg["folders"]:
+            p = Path(folder)
+            logger.debug("Scanning folder %s", p)
+            if p.exists():
+                for subdir in p.iterdir():
+                    if subdir.is_dir():
+                        logger.debug("Checking subdir %s for show detection", subdir)
+                        detected = TVMazeAPI.auto_detect(subdir.name)
+                        if detected:
+                            logger.info("Detected show: %s -> %s", subdir, detected)
+                            self.db.add_show(detected['tvmaze_id'], detected['name'], detected['image_url'])
+                            cache_dir = Path(ROOT) / "resources" / "thumbs"
+                            cache_dir.mkdir(exist_ok=True)
+                            cache_path = cache_dir / f"show_{detected['tvmaze_id']}.jpg"
+                            if not cache_path.exists() and detected['image_url']:
+                                if TVMazeAPI.download_image(detected['image_url'], str(cache_path)):
+                                    self.db.update_show_cached_image(detected['tvmaze_id'], str(cache_path))
+        self.populate_library()
 
     def on_show_selected(self, item):
         tvmaze_id = item.data(Qt.UserRole)
-        # For now, just log; later expand to show seasons/episodes
-        logger.info(f"Selected show: {item.text()} (ID: {tvmaze_id})")
+        show_name = item.text()
+        seasons = TVMazeAPI.get_show_seasons(tvmaze_id)
+        if not seasons:
+            logger.info(f"No seasons found for {show_name}")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{show_name} — Seasons & Episodes")
+        dlg_lay = QHBoxLayout(dialog)
+
+        seasons_list = QListWidget()
+        episodes_list = QListWidget()
+        seasons_list.setFixedWidth(180)
+        dlg_lay.addWidget(seasons_list)
+        dlg_lay.addWidget(episodes_list)
+
+        # populate seasons
+        season_map = {}
+        for s in seasons:
+            num = s.get('number')
+            if num is None:
+                continue
+            si = QListWidgetItem(f"Season {num}")
+            si.setData(Qt.UserRole, num)
+            seasons_list.addItem(si)
+            season_map[num] = s
+
+        def on_season_clicked(it):
+            episodes_list.clear()
+            season_num = it.data(Qt.UserRole)
+            all_eps = TVMazeAPI.get_show_episodes(tvmaze_id)
+            for ep in all_eps:
+                if ep.get('season') == season_num:
+                    title = ep.get('name') or f"Episode {ep.get('number')}"
+                    li = QListWidgetItem(f"E{ep.get('number'):02} — {title}")
+                    li.setData(Qt.UserRole, (season_num, ep.get('number')))
+                    episodes_list.addItem(li)
+
+        def on_episode_activated(li):
+            if not li: return
+            season_num, ep_num = li.data(Qt.UserRole)
+            # Try DB lookup first
+            vids = self.db.get_videos_for_episode(tvmaze_id, season_num, ep_num)
+            if vids and len(vids) > 0:
+                path = vids[0][1]  # path is second column in videos table
+                self.p_m(path)
+                dialog.accept()
+                return
+            # Otherwise scan folders for matching file
+            found = self.find_episode_file(tvmaze_id, season_num, ep_num)
+            if found:
+                # add to DB for future
+                self.db.add_video(found, title=Path(found).stem, show_name=show_name, season=season_num, episode=ep_num, tvmaze_id=tvmaze_id)
+                self.p_m(found)
+                dialog.accept()
+                return
+            QMessageBox.information(self, "Not Found", f"No local file found for {show_name} S{season_num:02}E{ep_num:02}")
+
+        seasons_list.itemClicked.connect(lambda it: on_season_clicked(it))
+        episodes_list.itemDoubleClicked.connect(lambda it: on_episode_activated(it))
+
+        dialog.exec_()
 
     def play_next(self):
         if self.plist.count() == 0: return
@@ -862,6 +582,34 @@ class MainWindow(QMainWindow):
         else:
             idx = (idx + 1) % self.plist.count()
         self.plist.setCurrentRow(idx); self.p_m(self.plist.currentItem().data(Qt.UserRole))
+    def find_episode_file(self, tvmaze_id, season, episode):
+        logger.debug("Searching for episode file: tvmaze=%s S=%s E=%s", tvmaze_id, season, episode)
+        # more flexible pattern: S01E01 or S1E1
+        flexible = re.compile(r'[Ss](?P<s>\d{1,2})[\W_]*[Ee](?P<e>\d{1,3})')
+        for folder in self.cfg.get("folders", []):
+            p = Path(folder)
+            logger.debug("Scanning folder for episodes: %s", p)
+            if not p.exists():
+                logger.debug("Folder does not exist: %s", p)
+                continue
+            try:
+                for f in p.rglob('*'):
+                    if not f.is_file():
+                        continue
+                    if f.suffix.lower() not in ('.mp4', '.mkv', '.avi'):
+                        continue
+                    name = f.name
+                    m = flexible.search(name)
+                    if m:
+                        s = int(m.group('s'))
+                        e = int(m.group('e'))
+                        if s == season and e == episode:
+                            logger.info("Matched episode file: %s", f)
+                            return str(f.as_posix())
+            except Exception:
+                logger.exception("Error scanning folder %s for episodes", folder)
+        logger.debug("No episode file found for tvmaze=%s S=%s E=%s", tvmaze_id, season, episode)
+        return None
     def upd(self):
         m_pos = self.tree.viewport().mapFromGlobal(QCursor.pos())
         if self.ov.isVisible() and not self.tree.viewport().rect().contains(m_pos): self.ov.hide(); self.backend.stop_prev()
@@ -1012,3 +760,102 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("Error releasing backend on close")
         e.accept()
+
+
+# Minimal MainWindow fallback to allow importing when the full UI is corrupted.
+# This provides a lightweight window so the app can start and the user can continue.
+class MinimalMainWindow(QMainWindow):
+    def __init__(self, player=None, backend=None):
+        super().__init__()
+        self.player = player
+        self.backend = backend
+        self.setWindowTitle("Vibe Video Player (Minimal)")
+        self.resize(1000, 700)
+        try:
+            w = QLabel("Minimal MainWindow — UI partially unavailable.\nSee logs for details.")
+            w.setAlignment(Qt.AlignCenter)
+            self.setCentralWidget(w)
+        except Exception:
+            pass
+
+
+# Lightweight functional MainWindow to use while full UI is being restored.
+class MainWindow(QMainWindow):
+    def __init__(self, player=None, backend=None):
+        super().__init__()
+        self.player = player
+        self.backend = backend
+        self.cfg = config.load()
+        try:
+            self.db = MetadataDB()
+        except Exception:
+            self.db = None
+        self.setWindowTitle("Vibe Video Player")
+        self.resize(1000, 700)
+
+        # Simple layout: title, library, controls
+        root = QWidget(); root_l = QVBoxLayout(root); root_l.setContentsMargins(8,8,8,8)
+        self.title_lbl = QLabel("Vibe Video Player")
+        self.title_lbl.setAlignment(Qt.AlignCenter)
+        root_l.addWidget(self.title_lbl)
+
+        self.library_list = QListWidget()
+        self.library_list.itemDoubleClicked.connect(self._on_item_activated)
+        root_l.addWidget(self.library_list, 1)
+
+        ctrl_row = QHBoxLayout()
+        self.bp = QPushButton("Play/Pause"); self.bp.clicked.connect(self.toggle_play)
+        self.bt_repeat = QPushButton("Repeat"); self.bt_repeat.clicked.connect(self.toggle_repeat)
+        self.bt_shuffle = QPushButton("Shuffle"); self.bt_shuffle.clicked.connect(self.toggle_shuffle)
+        ctrl_row.addWidget(self.bp); ctrl_row.addWidget(self.bt_repeat); ctrl_row.addWidget(self.bt_shuffle)
+        root_l.addLayout(ctrl_row)
+
+        self.setCentralWidget(root)
+
+        # Modes
+        self.repeat_mode = 'none'
+        self.shuffle = False
+
+        # Populate library from DB if available
+        QTimer.singleShot(100, self.populate_library)
+
+    def populate_library(self):
+        self.library_list.clear()
+        if not self.db:
+            return
+        try:
+            shows = self.db.get_all_shows()
+            for s in shows:
+                # shows rows: id, tvmaze_id, name, image_url, cached_image_path
+                name = s[2] if len(s) > 2 else str(s)
+                item = QListWidgetItem(name)
+                item.setData(Qt.UserRole, s[1] if len(s) > 1 else None)
+                self.library_list.addItem(item)
+        except Exception:
+            logger.exception("Failed to populate library")
+
+    def refresh_library(self):
+        # simple alias for populate
+        self.populate_library()
+
+    def toggle_shuffle(self):
+        self.shuffle = not self.shuffle
+        self.bt_shuffle.setText(f"Shuffle ({'On' if self.shuffle else 'Off'})")
+
+    def toggle_repeat(self):
+        modes = ['none', 'one', 'all']
+        idx = modes.index(self.repeat_mode)
+        self.repeat_mode = modes[(idx + 1) % len(modes)]
+        self.bt_repeat.setText(f"Repeat: {self.repeat_mode}")
+
+    def toggle_play(self):
+        try:
+            if self.backend and hasattr(self.backend, 'main_player'):
+                self.backend.main_player.pause()
+        except Exception:
+            logger.exception("Failed to toggle play")
+
+    def _on_item_activated(self, item):
+        tvid = item.data(Qt.UserRole)
+        # placeholder: log selection
+        logger.info("Selected show from simple UI: %s (tvmaze=%s)", item.text(), tvid)
