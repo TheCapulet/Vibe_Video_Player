@@ -8,11 +8,7 @@ FILE = "config.json"
 D = {
     "folders": [], "text_size": 10, "preview_start": 120, "card_width": 220,
     "show_static": True, "show_video": True, "volume": 70, "sidebar_width": 350,
-    "autohide_windowed": False, "nicknames": {}, "playlist": [],
-    # icon pack settings
-    "installed_icon_pack": "default",
-    "accepted_icon_licenses": {},
-    "auto_accept_licenses": False
+    "autohide_windowed": False, "nicknames": {}, "playlist": []
 }
 
 def load():
