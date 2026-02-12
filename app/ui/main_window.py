@@ -765,15 +765,10 @@ class MainWindow(QMainWindow):
             self.tree.viewport().update()
     def on_hover(self, it, col):
         p = it.data(0, Qt.UserRole)
-        if self.cfg["show_video"] and p and not os.path.isdir(p):
-            rect = self.tree.visualItemRect(it); tw = self.cfg["card_width"]
-            self.ov.setFixedSize(tw, int(tw*0.56)); self.ov.move(self.mapFromGlobal(self.tree.viewport().mapToGlobal(rect.topLeft() + QPoint(30, 5))))
-            self.ov.show(); self.ov.raise_(); self.backend.open_prev(p, self.cfg["preview_start"])
-            self._hover_preview = p
-        else:
-            self.ov.hide()
-            self.backend.stop_prev()
-            self._hover_preview = None
+        # Removed hover video preview - always hide overlay
+        self.ov.hide()
+        self.backend.stop_prev()
+        self._hover_preview = None
     def on_activated(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p): self.p_m(p)
@@ -877,7 +872,9 @@ class MainWindow(QMainWindow):
             if item.data(0, Qt.DecorationRole) is None and not os.path.isdir(p) and p != "None":
                 tp = os.path.join(str(ROOT), "resources", "thumbs", f"{get_h(p)}.jpg")
                 if os.path.exists(tp):
-                    item.setData(0, Qt.DecorationRole, QPixmap(tp))
+                    pix = QPixmap(tp)
+                    if not pix.isNull():
+                        item.setData(0, Qt.DecorationRole, pix)
                 else:
                     try:
                         # Ensure worker is alive before writing

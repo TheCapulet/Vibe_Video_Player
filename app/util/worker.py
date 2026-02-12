@@ -114,7 +114,13 @@ def run():
                                     if p.get_length() > 0:
                                         break
                                     time.sleep(0.1)
-                                t = int(seek) * 1000 if p.get_length() > int(seek) * 1000 else p.get_length() // 2
+                                length = p.get_length()
+                                if length > 60000:
+                                    # For long videos, use 30s
+                                    t = 30000
+                                else:
+                                    # For short videos, use middle
+                                    t = length // 2
                                 try:
                                     logger.debug("Setting time %s ms and taking snapshot to %s", t, tp)
                                     p.set_time(t)
@@ -172,7 +178,13 @@ def run():
                         if p.get_length() > 0:
                             break
                         time.sleep(0.1)
-                    t = int(seek) * 1000 if p.get_length() > int(seek) * 1000 else p.get_length() // 2
+                    length = p.get_length()
+                    if length > 60000:
+                        # For long videos, use 30s
+                        t = 30000
+                    else:
+                        # For short videos, use middle
+                        t = length // 2
                     try:
                         logger.debug("Setting time %s ms and taking snapshot to %s", t, tp)
                         p.set_time(t)
