@@ -296,11 +296,20 @@ class TVStyleShowsWidget(QWidget):
             }
         """)
         
+        # Enable context menu
+        card.setContextMenuPolicy(Qt.CustomContextMenu)
+        
         # Click handler
-        card.mousePressEvent = lambda e, s=show_data: self._on_show_clicked(s)
+        def mouse_press_event(e, s=show_data):
+            if e.button() == Qt.LeftButton:
+                self._on_show_clicked(s)
+            elif e.button() == Qt.RightButton:
+                # Right click handled by context menu
+                pass
+        card.mousePressEvent = mouse_press_event
         
         # Context menu for right-click
-        def context_menu_event(event):
+        def context_menu_event(pos):
             menu = QMenu(self)
             menu.setStyleSheet("""
                 QMenu {
@@ -323,7 +332,7 @@ class TVStyleShowsWidget(QWidget):
             menu.addSeparator()
             remove_action = menu.addAction("🗑️  Remove Show")
             
-            action = menu.exec_(card.mapToGlobal(event.pos()))
+            action = menu.exec_(card.mapToGlobal(pos))
             if action == play_action:
                 self._play_all_show_episodes(show_data)
             elif action == info_action:
@@ -331,7 +340,7 @@ class TVStyleShowsWidget(QWidget):
             elif action == remove_action:
                 self._remove_show(show_data)
         
-        card.contextMenuEvent = context_menu_event
+        card.customContextMenuRequested.connect(context_menu_event)
         
         return card
         
@@ -431,10 +440,16 @@ class TVStyleShowsWidget(QWidget):
             }
         """)
         
-        card.mousePressEvent = lambda e, s=season_data: self._on_season_clicked(s)
+        # Enable context menu
+        card.setContextMenuPolicy(Qt.CustomContextMenu)
+        
+        def season_mouse_press(e, s=season_data):
+            if e.button() == Qt.LeftButton:
+                self._on_season_clicked(s)
+        card.mousePressEvent = season_mouse_press
         
         # Context menu for right-click
-        def season_context_menu(event):
+        def season_context_menu(pos):
             menu = QMenu(self)
             menu.setStyleSheet("""
                 QMenu {
@@ -454,11 +469,11 @@ class TVStyleShowsWidget(QWidget):
             
             play_action = menu.addAction("▶  Play All Episodes in Season")
             
-            action = menu.exec_(card.mapToGlobal(event.pos()))
+            action = menu.exec_(card.mapToGlobal(pos))
             if action == play_action:
                 self._play_all_season_episodes(season_data)
         
-        card.contextMenuEvent = season_context_menu
+        card.customContextMenuRequested.connect(season_context_menu)
         
         return card
         

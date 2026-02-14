@@ -11,7 +11,7 @@ from app.ui.library import LibraryDelegate, get_h
 from app.util.logger import setup_app_logger
 from app.util.metadata_db import MetadataDB
 from app.util.tvmaze_api import TVMazeAPI
-from app.util.metadata_scanner import MetadataScanner, QuickMetadataScanner
+from app.util.robust_scanner import RobustMetadataScanner
 from app.ui.shows_browser import TVStyleShowsWidget
 try:
     import inputs
@@ -604,9 +604,17 @@ class MainWindow(QMainWindow):
         shows_layout.setContentsMargins(0, 0, 0, 0)
         shows_layout.addWidget(self.shows_browser)
         
-        # Watch tab footer with reset options
+        # Watch tab footer with scan and reset options
         shows_footer = QHBoxLayout()
         shows_footer.setContentsMargins(5, 5, 5, 5)
+        
+        btn_refresh = QPushButton("🔄 Refresh")
+        btn_refresh.setToolTip("Refresh the Watch tab view")
+        btn_refresh.clicked.connect(self.shows_browser.refresh)
+        
+        btn_scan_all = QPushButton("🔍 Scan All Folders")
+        btn_scan_all.setToolTip("Scan all library folders for TV shows")
+        btn_scan_all.clicked.connect(self._scan_all_folders_batch)
         
         btn_reset_metadata = QPushButton("🗑️ Reset Metadata")
         btn_reset_metadata.setToolTip("Clear all TV show metadata and rescan")
@@ -616,6 +624,8 @@ class MainWindow(QMainWindow):
         btn_reset_db.setToolTip("Delete entire database and start fresh")
         btn_reset_db.clicked.connect(self._reset_database)
         
+        shows_footer.addWidget(btn_refresh)
+        shows_footer.addWidget(btn_scan_all)
         shows_footer.addWidget(btn_reset_metadata)
         shows_footer.addWidget(btn_reset_db)
         shows_footer.addStretch()
@@ -813,38 +823,147 @@ class MainWindow(QMainWindow):
         self.show_shows_grid()
     
     def _init_metadata_scanner(self):
-        """Initialize the metadata scanner."""
-        self.metadata_scanner = MetadataScanner(self.db)
+        """Initialize the robust metadata scanner."""
+        self.metadata_scanner = RobustMetadataScanner(self.db)
         # Connect signals
-        self.metadata_scanner.signals.show_detected.connect(self._on_show_detected)
-        self.metadata_scanner.signals.show_not_found.connect(self._on_show_not_found)
-        self.metadata_scanner.signals.progress.connect(self._on_scan_progress)
-        self.metadata_scanner.signals.error.connect(self._on_scan_error)
-        self.metadata_scanner.start()
+        self.metadata_scanner.job_started.connect(self._on_job_started)
+        self.metadata_scanner.job_progress.connect(self._on_job_progress)
+        self.metadata_scanner.job_completed.connect(self._on_job_completed)
+        self.metadata_scanner.job_error.connect(self._on_job_error)
+        self.metadata_scanner.job_uncertain.connect(self._on_job_uncertain)
+        self.metadata_scanner.all_jobs_complete.connect(self._on_all_jobs_complete)
+        self.metadata_scanner.scan_stats.connect(self._on_scan_stats)
     
-    def _on_show_detected(self, folder_path, show_name, tvmaze_id):
-        """Handle show detection."""
-        logger.info(f"Show detected: {show_name}")
-        # Refresh shows grid to show new show
-        self.show_shows_grid()
+    def _on_job_started(self, folder_path):
+        """Handle job started."""
+        logger.info(f"[SCAN] Started: {Path(folder_path).name}")
     
-    def _on_show_not_found(self, folder_path):
-        """Handle show not found."""
-        logger.info(f"No show found for: {folder_path}")
-    
-    def _on_scan_progress(self, message):
-        """Handle scan progress update."""
-        # Could update a status bar here
+    def _on_job_progress(self, folder, stage, details):
+        """Handle job progress update."""
+        # This will be connected to progress dialog if open
         pass
     
-    def _on_scan_error(self, folder_path, error_message):
-        """Handle scan error."""
-        logger.error(f"Scan error for {folder_path}: {error_message}")
+    def _on_job_completed(self, folder_path, show_data):
+        """Handle job completion."""
+        if show_data:
+            logger.info(f"[SCAN] Completed: {Path(folder_path).name} -> {show_data['name']}")
+        else:
+            logger.info(f"[SCAN] Completed: {Path(folder_path).name} (no match)")
+        # Refresh shows browser
+        self.shows_browser.refresh()
+    
+    def _on_job_error(self, folder_path, error_message):
+        """Handle job error."""
+        logger.error(f"[SCAN] Error: {Path(folder_path).name} - {error_message}")
+    
+    def _on_job_uncertain(self, folder_path, possible_shows):
+        """Handle uncertain match - show dialog for user."""
+        logger.info(f"[SCAN] Uncertain: {Path(folder_path).name} - {len(possible_shows)} options")
+        # Show dialog modally - scan will wait for user input
+        dialog = UncertainMatchDialog(self, folder_path, possible_shows)
+        
+        if dialog.exec() == QDialog.Accepted and dialog.selected_show:
+            # User selected a show - resolve it
+            show_data = dialog.selected_show
+            # Format the show data properly for the new scanner
+            formatted_show = {
+                'tvmaze_id': show_data.get('tvmaze_id') or show_data.get('id'),
+                'name': show_data['name'],
+                'image_url': show_data.get('image_url') or (show_data.get('image', {}).get('medium') if isinstance(show_data.get('image'), dict) else None),
+                'type': show_data.get('type'),
+                'confidence': 100
+            }
+            self.metadata_scanner.resolve_uncertain_match(folder_path, formatted_show)
+            QMessageBox.information(self, "Success", f"Associated folder with {show_data['name']}")
+        elif dialog.skip_all_remaining:
+            # User chose to skip all remaining uncertain matches
+            self.metadata_scanner.skip_uncertain_match(folder_path)
+        else:
+            # User just closed dialog or skipped this one
+            self.metadata_scanner.skip_uncertain_match(folder_path)
+    
+    def _on_all_jobs_complete(self):
+        """Handle all jobs complete."""
+        logger.info("[SCAN] All jobs complete")
+        self.shows_browser.refresh()
+    
+    def _on_scan_stats(self, total, completed, errors):
+        """Handle scan stats update."""
+        logger.info(f"[SCAN] Stats: {completed}/{total} completed, {errors} errors")
+    
+    def _scan_all_folders_batch(self):
+        """Batch scan all folders for TV shows with progress dialog."""
+        # Collect all show folders from the library
+        all_folders = []
+        
+        for root_folder in self.cfg["folders"]:
+            root_path = Path(root_folder)
+            if not root_path.exists():
+                continue
+            
+            # Check immediate subfolders (likely show folders)
+            for item in root_path.iterdir():
+                if item.is_dir() and not item.name.startswith('.'):
+                    # Check if it's a season folder
+                    import re
+                    if re.match(r'^(season\s*\d+|s\d+)$', item.name, re.IGNORECASE):
+                        continue
+                    
+                    # Check if it has videos
+                    has_videos = any(
+                        item.rglob(f'*{ext}') 
+                        for ext in ['.mp4', '.mkv', '.avi']
+                    )
+                    
+                    if has_videos:
+                        # Check if already in database
+                        show_name = item.name
+                        # We'll check database when scanning
+                        all_folders.append({
+                            'path': str(item),
+                            'name': show_name,
+                            'video_count': len(list(item.rglob('*.mp4'))) + 
+                                         len(list(item.rglob('*.mkv'))) +
+                                         len(list(item.rglob('*.avi')))
+                        })
+        
+        if not all_folders:
+            QMessageBox.information(self, "No Folders Found", 
+                "No video folders found to scan.")
+            return
+        
+        # Check which folders are already in database
+        existing_shows = self.db.get_all_shows()
+        existing_names = {s[2].lower() for s in existing_shows}  # show names
+        
+        folders_to_scan = []
+        for folder in all_folders:
+            # Check if folder name matches any existing show
+            if folder['name'].lower() not in existing_names:
+                folders_to_scan.append(folder)
+        
+        if not folders_to_scan:
+            QMessageBox.information(self, "All Folders Scanned", 
+                f"All {len(all_folders)} folders are already in the database.")
+            return
+        
+        # Reset scanner and add jobs
+        self.metadata_scanner.reset()
+        for folder_info in folders_to_scan:
+            self.metadata_scanner.add_job(folder_info['path'], silent=False)
+        
+        # Show and run progress dialog
+        progress = ScanProgressDialog(self, folders_to_scan, self.metadata_scanner)
+        progress.scan_complete.connect(self.shows_browser.refresh)
+        progress.exec()
     
     def _scan_folder_for_shows(self, folder_path, parent_tree_item, prompt_on_failure=False):
-        """Queue a folder for metadata scanning."""
+        """Scan a single folder for TV shows."""
         if hasattr(self, 'metadata_scanner'):
-            self.metadata_scanner.queue_folder(folder_path, silent=not prompt_on_failure)
+            # Reset and add just this folder
+            self.metadata_scanner.reset()
+            self.metadata_scanner.add_job(folder_path, silent=not prompt_on_failure)
+            self.metadata_scanner.start_scan()
 
     def on_expand(self, item):
         if item.childCount() > 0: return
@@ -885,6 +1004,7 @@ class MainWindow(QMainWindow):
         if checked or (p and not os.path.isdir(p)):
             add_pl = menu.addAction("Add Selected to Playlist")
             rename_meta = menu.addAction("Rename based on Metadata")
+            edit_meta = menu.addAction("Edit Episode Metadata")
             act = menu.exec(QCursor.pos())
             if act == add_pl:
                 for path in (checked if checked else [p]):
@@ -896,6 +1016,9 @@ class MainWindow(QMainWindow):
                 for path in (checked if checked else [p]):
                     self.rename_file_based_on_metadata(path)
                 self.ref()  # Refresh the tree after renaming
+            elif act == edit_meta:
+                for path in (checked if checked else [p]):
+                    self._edit_episode_metadata(path)
         elif p and os.path.isdir(p):
             p_all = menu.addAction("Add All to Playlist"); p_rnd = menu.addAction("Add All Randomized")
             # Check if folder has metadata
@@ -961,10 +1084,33 @@ class MainWindow(QMainWindow):
             logger.exception(f"Error renaming {path}")
             QMessageBox.warning(self, "Rename Failed", f"Error renaming file: {str(e)}")
     def associate_folder_with_show(self, folder_path, show_data):
-        """Queue folder for metadata scanning with specific show data."""
-        logger.info(f"Queuing folder for manual show association: {folder_path}")
-        if hasattr(self, 'metadata_scanner'):
-            self.metadata_scanner.queue_folder(folder_path, silent=False)
+        """Manually associate folder with specific show data from user selection."""
+        logger.info(f"Manually associating folder {folder_path} with {show_data['name']}")
+        try:
+            # Format show data properly
+            formatted_show = {
+                'tvmaze_id': show_data['id'],
+                'name': show_data['name'],
+                'image_url': (show_data.get('image') or {}).get('medium'),
+                'type': show_data.get('type'),
+                'confidence': 100  # User manually selected
+            }
+            
+            # Store metadata
+            self.metadata_scanner._store_show_metadata(formatted_show)
+            
+            # Get video files and associate
+            folder = Path(folder_path)
+            video_files = self.metadata_scanner._find_video_files(folder)
+            self.metadata_scanner._associate_videos(folder, formatted_show, video_files)
+            
+            # Refresh the shows browser
+            self.shows_browser.refresh()
+            
+            logger.info(f"Successfully associated {folder_path} with {show_data['name']}")
+        except Exception as e:
+            logger.exception(f"Error associating folder with show: {e}")
+            QMessageBox.warning(self, "Error", f"Failed to associate folder: {str(e)}")
 
     def folder_has_metadata(self, folder_path):
         """Check if any video in the folder has associated metadata."""
@@ -994,6 +1140,99 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Success", f"Associated folder with {dialog.selected_show['name']}")
         except Exception:
             logger.exception(f"Error searching metadata for folder {folder_path}")
+
+    def _edit_episode_metadata(self, video_path):
+        """Edit metadata for an individual episode file."""
+        try:
+            from pathlib import Path
+            parsed = TVMazeAPI.parse_filename(Path(video_path).stem, video_path)
+            
+            if parsed['type'] != 'episode':
+                QMessageBox.information(self, "Not an Episode", 
+                    "This file doesn't appear to be a TV episode.\n\n"
+                    "Expected format: S01E01 or similar")
+                return
+            
+            # Search for the show
+            dialog = TVMazeSearchDialog(self)
+            dialog.setWindowTitle(f"Search Show for: {Path(video_path).name}")
+            dialog.search_edit.setText(parsed['show_name'])
+            dialog.search()
+            
+            if dialog.exec() == QDialog.Accepted and dialog.selected_show:
+                show_data = dialog.selected_show
+                
+                # Get the episode from the database or fetch it
+                show_record = self.db.get_show(show_data['id'])
+                if not show_record:
+                    # Add show to database
+                    self.db.add_show(show_data['id'], show_data['name'], 
+                                   (show_data.get('image') or {}).get('medium'))
+                    show_record = self.db.get_show(show_data['id'])
+                
+                show_id = show_record[0]
+                
+                # Get or create season
+                season_record = self.db.get_season(show_id, parsed['season'])
+                if not season_record:
+                    # Add season
+                    self.db.add_season(show_id, parsed['season'])
+                    season_record = self.db.get_season(show_id, parsed['season'])
+                
+                season_id = season_record[0]
+                
+                # Get episode from API
+                seasons = TVMazeAPI.get_show_seasons(show_data['id'])
+                target_season = None
+                for season in seasons:
+                    if season and season.get('number') == parsed['season']:
+                        target_season = season
+                        break
+                
+                if target_season:
+                    episodes = TVMazeAPI.get_season_episodes(target_season['id'])
+                    target_episode = None
+                    for ep in episodes:
+                        if ep and ep.get('number') == parsed['episode']:
+                            target_episode = ep
+                            break
+                    
+                    if target_episode:
+                        # Add episode to database
+                        self.db.add_episode(
+                            season_id,
+                            target_episode['number'],
+                            target_episode['name'],
+                            target_episode.get('airdate'),
+                            target_episode.get('summary'),
+                            (target_episode.get('image') or {}).get('medium')
+                        )
+                        
+                        # Get the episode record
+                        episode_record = self.db.get_episode(season_id, target_episode['number'])
+                        if episode_record:
+                            # Associate video with episode
+                            self.db.associate_video_with_episode(video_path, episode_record[0])
+                            QMessageBox.information(self, "Success", 
+                                f"Associated video with:\n\n"
+                                f"Show: {show_data['name']}\n"
+                                f"Season {parsed['season']}, Episode {parsed['episode']}\n"
+                                f"Title: {target_episode['name']}")
+                            # Refresh shows browser
+                            self.shows_browser.refresh()
+                        else:
+                            QMessageBox.warning(self, "Error", "Failed to add episode to database")
+                    else:
+                        QMessageBox.warning(self, "Episode Not Found", 
+                            f"Could not find Season {parsed['season']}, Episode {parsed['episode']} "
+                            f"for {show_data['name']}")
+                else:
+                    QMessageBox.warning(self, "Season Not Found", 
+                        f"Could not find Season {parsed['season']} for {show_data['name']}")
+                        
+        except Exception as e:
+            logger.exception(f"Error editing episode metadata: {e}")
+            QMessageBox.warning(self, "Error", f"Failed to edit metadata: {str(e)}")
 
     def sort_pl(self):
         items = []
@@ -1284,3 +1523,445 @@ class TVMazeSearchDialog(QDialog):
         if item:
             self.selected_show = item.data(Qt.UserRole)
             self.accept()
+
+class UncertainMatchDialog(QDialog):
+    """Dialog for handling uncertain show matches."""
+    def __init__(self, parent=None, folder_path="", possible_shows=None, remaining_count=0):
+        super().__init__(parent)
+        self.folder_path = folder_path
+        self.possible_shows = possible_shows or []
+        self.remaining_count = remaining_count
+        self.selected_show = None
+        self.skip_all_remaining = False
+        
+        self.setWindowTitle("Uncertain Show Match")
+        self.setModal(True)
+        self.resize(600, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        # Header
+        folder_name = Path(folder_path).name
+        header = QLabel(f"<b>Uncertain Match for: {folder_name}</b>")
+        header.setStyleSheet("font-size: 16px; color: white;")
+        layout.addWidget(header)
+        
+        # Description
+        desc = QLabel("The automatic scanner found multiple possible matches for this folder. "
+                     "Please select the correct show, search for a different one, or skip this folder.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #aaa;")
+        layout.addWidget(desc)
+        
+        # Remaining counter
+        if remaining_count > 0:
+            remaining_label = QLabel(f"<i>{remaining_count} more folder(s) to review after this one</i>")
+            remaining_label.setStyleSheet("color: #888;")
+            layout.addWidget(remaining_label)
+        
+        layout.addSpacing(10)
+        
+        # Possible shows list
+        shows_label = QLabel("Possible Matches:")
+        shows_label.setStyleSheet("font-weight: bold; color: white;")
+        layout.addWidget(shows_label)
+        
+        self.shows_list = QListWidget()
+        self.shows_list.setStyleSheet("""
+            QListWidget {
+                background: #1a1a1a;
+                border: 1px solid #444;
+                color: white;
+            }
+            QListWidget::item {
+                padding: 10px;
+                border-bottom: 1px solid #333;
+            }
+            QListWidget::item:selected {
+                background: #4CAF50;
+            }
+        """)
+        
+        for show in self.possible_shows:
+            confidence = show.get('confidence', 0)
+            item_text = f"{show['name']} (Confidence: {confidence:.1f}%)"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, show)
+            self.shows_list.addItem(item)
+        
+        self.shows_list.itemDoubleClicked.connect(self.accept_selection)
+        layout.addWidget(self.shows_list)
+        
+        # Search alternative section
+        search_layout = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Or search for a different show...")
+        self.search_edit.returnPressed.connect(self.search_alternative)
+        search_btn = QPushButton("Search")
+        search_btn.clicked.connect(self.search_alternative)
+        search_layout.addWidget(self.search_edit)
+        search_layout.addWidget(search_btn)
+        layout.addLayout(search_layout)
+        
+        # Alternative search results
+        self.alt_results_list = QListWidget()
+        self.alt_results_list.setVisible(False)
+        self.alt_results_list.itemDoubleClicked.connect(self.accept_alt_selection)
+        layout.addWidget(self.alt_results_list)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        self.skip_btn = QPushButton("Skip This Folder")
+        self.skip_btn.clicked.connect(self.reject)
+        
+        self.skip_all_btn = QPushButton("Skip All Remaining")
+        self.skip_all_btn.clicked.connect(self.skip_all)
+        if remaining_count == 0:
+            self.skip_all_btn.setVisible(False)
+        
+        self.select_btn = QPushButton("Select Show")
+        self.select_btn.clicked.connect(self.accept_selection)
+        self.select_btn.setDefault(True)
+        
+        btn_layout.addWidget(self.skip_btn)
+        btn_layout.addWidget(self.skip_all_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.select_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # Select first item by default
+        if self.shows_list.count() > 0:
+            self.shows_list.setCurrentRow(0)
+    
+    def search_alternative(self):
+        """Search for alternative shows."""
+        query = self.search_edit.text().strip()
+        if not query:
+            return
+        
+        self.alt_results_list.clear()
+        results = TVMazeAPI.search_show(query)
+        
+        if results:
+            self.alt_results_list.setVisible(True)
+            for result in results[:10]:
+                show = result['show']
+                item_text = f"{show['name']} ({show.get('premiered', 'Unknown')})"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, show)
+                self.alt_results_list.addItem(item)
+        else:
+            QMessageBox.information(self, "No Results", "No shows found for that search term.")
+    
+    def accept_selection(self):
+        """Accept the selected show."""
+        # Check alternative results first
+        if self.alt_results_list.isVisible() and self.alt_results_list.currentItem():
+            show = self.alt_results_list.currentItem().data(Qt.UserRole)
+            self.selected_show = {
+                'tvmaze_id': show['id'],
+                'name': show['name'],
+                'image_url': (show.get('image') or {}).get('medium'),
+                'type': show.get('type'),
+                'confidence': 100  # User manually selected
+            }
+            self.accept()
+            return
+        
+        # Check main list
+        if self.shows_list.currentItem():
+            self.selected_show = self.shows_list.currentItem().data(Qt.UserRole)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "No Selection", "Please select a show from the list.")
+    
+    def accept_alt_selection(self):
+        """Accept selection from alternative search results."""
+        if self.alt_results_list.currentItem():
+            show = self.alt_results_list.currentItem().data(Qt.UserRole)
+            self.selected_show = {
+                'tvmaze_id': show['id'],
+                'name': show['name'],
+                'image_url': (show.get('image') or {}).get('medium'),
+                'type': show.get('type'),
+                'confidence': 100
+            }
+            self.accept()
+    
+    def skip_all(self):
+        """Skip all remaining uncertain matches."""
+        self.skip_all_remaining = True
+        self.reject()
+
+
+class ScanProgressDialog(QDialog):
+    """Progress dialog for scanning folders with real-time updates."""
+    
+    scan_complete = Signal()
+    
+    def __init__(self, parent=None, folders=None, scanner=None):
+        super().__init__(parent)
+        self.folders = folders or []
+        self.scanner = scanner
+        self.total_folders = len(folders)
+        self.completed_folders = 0
+        self.detected_shows = []
+        self.cancelled = False
+        
+        self.setWindowTitle("Scanning TV Shows")
+        self.setModal(True)
+        self.resize(600, 500)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # Header with progress
+        self.header = QLabel(f"Scanning 0 of {self.total_folders} folders...")
+        self.header.setStyleSheet("font-size: 16px; font-weight: bold; color: white;")
+        layout.addWidget(self.header)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(self.total_folders)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #444;
+                border-radius: 5px;
+                text-align: center;
+                color: white;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 3px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+        
+        # Detailed progress section
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(10, 10, 10, 10)
+        detail_widget.setStyleSheet("background: #1a1a1a; border-radius: 5px;")
+        
+        # Current folder being processed
+        self.current_folder_label = QLabel("Ready to start")
+        self.current_folder_label.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
+        detail_layout.addWidget(self.current_folder_label)
+        
+        # Stage (e.g., "Downloading Season 3")
+        self.stage_label = QLabel("Waiting...")
+        self.stage_label.setStyleSheet("color: #4CAF50; font-size: 12px;")
+        detail_layout.addWidget(self.stage_label)
+        
+        # Details (e.g., "Episodes 1-10")
+        self.details_label = QLabel("")
+        self.details_label.setStyleSheet("color: #888; font-size: 11px;")
+        detail_layout.addWidget(self.details_label)
+        
+        layout.addWidget(detail_widget)
+        
+        # Folders list
+        folders_header = QLabel("All Folders:")
+        folders_header.setStyleSheet("font-weight: bold; color: white;")
+        layout.addWidget(folders_header)
+        
+        self.folders_list = QListWidget()
+        self.folders_list.setStyleSheet("""
+            QListWidget {
+                background: #1a1a1a;
+                border: 1px solid #444;
+                color: #888;
+            }
+            QListWidget::item {
+                padding: 6px;
+                border-bottom: 1px solid #333;
+            }
+        """)
+        
+        for folder in self.folders:
+            item = QListWidgetItem(f"⏳ {folder['name']}")
+            item.setData(Qt.UserRole, folder['name'])
+            self.folders_list.addItem(item)
+        
+        layout.addWidget(self.folders_list)
+        
+        # Detected shows section
+        results_header = QLabel("Detected Shows:")
+        results_header.setStyleSheet("font-weight: bold; color: #4CAF50;")
+        layout.addWidget(results_header)
+        
+        self.results_list = QListWidget()
+        self.results_list.setMaximumHeight(100)
+        self.results_list.setStyleSheet("""
+            QListWidget {
+                background: #1a1a1a;
+                border: 1px solid #444;
+                color: white;
+            }
+            QListWidget::item {
+                padding: 6px;
+                border-bottom: 1px solid #333;
+                color: #4CAF50;
+            }
+        """)
+        layout.addWidget(self.results_list)
+        
+        # Status label
+        self.status_label = QLabel("Click Start to begin scanning")
+        self.status_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        self.start_btn = QPushButton(f"Start Scan ({len(self.folders)} folders)")
+        self.start_btn.setDefault(True)
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background: #45a049;
+            }
+        """)
+        self.start_btn.clicked.connect(self.start_scan)
+        
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        self.close_btn.setVisible(False)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.close_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # Connect to scanner signals
+        if self.scanner:
+            self.scanner.job_started.connect(self.on_job_started)
+            self.scanner.job_progress.connect(self.on_job_progress)
+            self.scanner.job_completed.connect(self.on_job_completed)
+            self.scanner.job_error.connect(self.on_job_error)
+            self.scanner.all_jobs_complete.connect(self.on_all_complete)
+            self.scanner.scan_stats.connect(self.on_scan_stats)
+    
+    def start_scan(self):
+        """Start the scan process."""
+        self.start_btn.setVisible(False)
+        self.cancel_btn.setText("Stop Scan")
+        self.status_label.setText("Scanning...")
+        self.status_label.setStyleSheet("color: #4CAF50;")
+        
+        # Start the scan
+        self.scanner.start_scan()
+    
+    def on_job_started(self, folder_path):
+        """Handle job started."""
+        folder_name = Path(folder_path).name
+        self.current_folder_label.setText(f"📁 {folder_name}")
+        self.stage_label.setText("Starting...")
+        self.details_label.setText("")
+        
+        # Update folder list
+        for i in range(self.folders_list.count()):
+            item = self.folders_list.item(i)
+            if item.data(Qt.UserRole) == folder_name:
+                item.setText(f"🔍 {folder_name}")
+                item.setForeground(QColor("#FFA500"))
+                self.folders_list.setCurrentItem(item)
+                self.folders_list.scrollToItem(item)
+                break
+    
+    def on_job_progress(self, folder, stage, details):
+        """Handle job progress."""
+        self.current_folder_label.setText(f"📁 {folder}")
+        self.stage_label.setText(stage)
+        self.details_label.setText(details)
+        
+        # Update folder list icon
+        for i in range(self.folders_list.count()):
+            item = self.folders_list.item(i)
+            if item.data(Qt.UserRole) == folder:
+                if "Searching" in stage:
+                    item.setText(f"🔍 {folder}")
+                elif "Downloading" in stage or "Fetching" in stage:
+                    item.setText(f"⬇️  {folder}")
+                    item.setForeground(QColor("#2196F3"))  # Blue for downloading
+                elif "Matching" in stage:
+                    item.setText(f"🔗 {folder}")
+                    item.setForeground(QColor("#9C27B0"))  # Purple for matching
+                elif "Complete" in stage:
+                    item.setText(f"✓ {folder}")
+                    item.setForeground(QColor("#4CAF50"))
+                self.folders_list.scrollToItem(item)
+                break
+    
+    def on_job_completed(self, folder_path, show_data):
+        """Handle job completion."""
+        folder_name = Path(folder_path).name
+        
+        # Update folder list
+        for i in range(self.folders_list.count()):
+            item = self.folders_list.item(i)
+            if item.data(Qt.UserRole) == folder_name:
+                if show_data:
+                    item.setText(f"✓ {folder_name} → {show_data['name']}")
+                    item.setForeground(QColor("#4CAF50"))
+                    # Add to results
+                    self.results_list.addItem(f"✓ {show_data['name']}")
+                    self.detected_shows.append(show_data['name'])
+                    self.status_label.setText(f"Found: {show_data['name']}")
+                else:
+                    item.setText(f"✗ {folder_name} (no match)")
+                    item.setForeground(QColor("#888"))
+                break
+        
+        self.results_list.scrollToBottom()
+    
+    def on_job_error(self, folder_path, error_message):
+        """Handle job error."""
+        folder_name = Path(folder_path).name
+        
+        for i in range(self.folders_list.count()):
+            item = self.folders_list.item(i)
+            if item.data(Qt.UserRole) == folder_name:
+                item.setText(f"❌ {folder_name} (error)")
+                item.setForeground(QColor("#F44336"))
+                break
+        
+        self.status_label.setText(f"Error: {folder_name}")
+    
+    def on_scan_stats(self, total, completed, errors):
+        """Handle scan stats update."""
+        self.completed_folders = completed
+        self.progress_bar.setValue(completed)
+        percentage = int((completed / total) * 100) if total > 0 else 0
+        self.header.setText(f"Scanning {completed} of {total} folders ({percentage}%)")
+    
+    def on_all_complete(self):
+        """Handle all jobs complete."""
+        self.header.setText(f"Scan Complete - {len(self.detected_shows)} shows found")
+        self.status_label.setText("All folders processed")
+        self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.cancel_btn.setVisible(False)
+        self.close_btn.setVisible(True)
+        self.close_btn.setDefault(True)
+        self.scan_complete.emit()
+    
+    def reject(self):
+        """Handle cancel/stop."""
+        self.cancelled = True
+        if self.scanner:
+            self.scanner.stop_scan()
+        super().reject()

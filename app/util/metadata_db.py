@@ -16,31 +16,28 @@ class MetadataDB:
         """Reset the entire database - delete all data."""
         with self._lock:
             try:
-                # Try to close any open connections by executing a checkpoint
-                try:
-                    with sqlite3.connect(self.db_path, timeout=5) as conn:
-                        conn.execute("VACUUM")
-                except:
-                    pass
+                # On Windows, we can't delete while connections are open
+                # Instead, we'll clear all tables
+                logger.info("Clearing all database tables...")
                 
-                # Close any existing connections by deleting the file
-                if os.path.exists(self.db_path):
-                    # Try multiple times with delay (Windows file locking)
-                    import time
-                    for attempt in range(5):
-                        try:
-                            os.remove(self.db_path)
-                            logger.info(f"Deleted database file: {self.db_path}")
-                            break
-                        except PermissionError:
-                            if attempt < 4:
-                                time.sleep(0.1)
-                            else:
-                                raise
+                with sqlite3.connect(self.db_path, timeout=30) as conn:
+                    # Get all table names
+                    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                    tables = cursor.fetchall()
+                    
+                    # Delete all data from each table
+                    for table in tables:
+                        table_name = table[0]
+                        if table_name != 'sqlite_sequence':  # Skip internal SQLite table
+                            conn.execute(f'DELETE FROM {table_name}')
+                    
+                    # Reset auto-increment counters
+                    conn.execute("DELETE FROM sqlite_sequence")
+                    
+                    # Vacuum to reclaim space
+                    conn.execute("VACUUM")
                 
-                # Reinitialize
-                self.init_db()
-                logger.info("Database reset complete")
+                logger.info("Database reset complete - all tables cleared")
                 return True
             except Exception as e:
                 logger.exception(f"Error resetting database: {e}")
