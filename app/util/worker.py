@@ -116,17 +116,19 @@ def run():
                                     time.sleep(0.1)
                                 length = p.get_length()
                                 if length > 60000:
-                                    # For long videos, use 30s
-                                    t = 30000
+                                    # For long videos, use 10% of length
+                                    t = length // 10
                                 else:
                                     # For short videos, use middle
                                     t = length // 2
+                                t = max(1000, t)  # Ensure at least 1 second in
                                 try:
                                     logger.debug("Setting time %s ms and taking snapshot to %s", t, tp)
                                     p.set_time(t)
-                                    time.sleep(1.2)
+                                    time.sleep(0.5)  # Reduced from 1.2 to speed up
                                     p.video_take_snapshot(0, tp, 320, 180)
                                     p.stop()
+                                    p.set_media(None)  # Release media to prevent state issues
                                     logger.info("Snapshot written: %s", tp)
                                 except Exception:
                                     logger.exception("Snapshot failed for %s -> %s", vpath, tp)
@@ -180,17 +182,19 @@ def run():
                         time.sleep(0.1)
                     length = p.get_length()
                     if length > 60000:
-                        # For long videos, use 30s
-                        t = 30000
+                        # For long videos, use 10% of length
+                        t = length // 10
                     else:
                         # For short videos, use middle
                         t = length // 2
+                    t = max(1000, t)  # Ensure at least 1 second in
                     try:
                         logger.debug("Setting time %s ms and taking snapshot to %s", t, tp)
                         p.set_time(t)
-                        time.sleep(1.2)
+                        time.sleep(0.5)  # Reduced from 1.2 to speed up
                         p.video_take_snapshot(0, tp, 320, 180)
                         p.stop()
+                        p.set_media(None)  # Release media to prevent state issues
                         logger.info("Snapshot written: %s", tp)
                     except Exception:
                         logger.exception("Snapshot failed for %s -> %s", vpath, tp)

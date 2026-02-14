@@ -11,6 +11,8 @@ from app.ui.library import LibraryDelegate, get_h
 from app.util.logger import setup_app_logger
 from app.util.metadata_db import MetadataDB
 from app.util.tvmaze_api import TVMazeAPI
+from app.util.metadata_scanner import MetadataScanner, QuickMetadataScanner
+from app.ui.shows_browser import TVStyleShowsWidget
 try:
     import inputs
     INPUTS_AVAILABLE = True
@@ -21,8 +23,73 @@ logger = setup_app_logger("MAIN_WINDOW")
 
 ROOT = Path(__file__).parent.parent.parent.absolute()
 def nat_sort(s): return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)]
-
 class ClickSlider(QSlider):
+    def mousePressEvent(self, e):
+        try:
+            if e.button() == Qt.LeftButton:
+                # Qt 6 uses position(), Qt 5 may use pos(); handle both
+                try:
+                    x = e.position().x()
+                except Exception:
+                    try:
+                        x = e.pos().x()
+                    except Exception:
+                        x = 0
+                v = self.minimum() + ((self.maximum() - self.minimum()) * x) / max(1, self.width())
+                self.setValue(int(v))
+                try:
+                    self.sliderMoved.emit(self.value())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return super().mousePressEvent(e)
+
+class TVMazeSearchDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Search TVMaze for Show")
+        self.setModal(True)
+        self.resize(600, 400)
+        lay = QVBoxLayout(self)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Enter show name...")
+        self.search_edit.returnPressed.connect(self.search)
+        lay.addWidget(self.search_edit)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self.search)
+        lay.addWidget(self.search_btn)
+        self.results_list = QListWidget()
+        self.results_list.itemDoubleClicked.connect(self.accept_selection)
+        lay.addWidget(self.results_list)
+        btn_lay = QHBoxLayout()
+        self.select_btn = QPushButton("Select")
+        self.select_btn.clicked.connect(self.accept_selection)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_lay.addStretch()
+        btn_lay.addWidget(self.select_btn)
+        btn_lay.addWidget(self.cancel_btn)
+        lay.addLayout(btn_lay)
+        self.selected_show = None
+
+    def search(self):
+        query = self.search_edit.text().strip()
+        if not query:
+            return
+        self.results_list.clear()
+        results = TVMazeAPI.search_show(query)
+        for result in results[:10]:  # Limit to 10
+            show = result['show']
+            item = QListWidgetItem(f"{show['name']} ({show.get('premiered', 'Unknown')})")
+            item.setData(Qt.UserRole, show)
+            self.results_list.addItem(item)
+
+    def accept_selection(self):
+        item = self.results_list.currentItem()
+        if item:
+            self.selected_show = item.data(Qt.UserRole)
+            self.accept()
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             v = self.minimum() + ((self.maximum()-self.minimum())*e.position().x())/self.width()
@@ -141,9 +208,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.cfg = config.load(); self.checked_paths = set()
+        # Initialize repeat and shuffle state
+        self.repeat_mode = 'none'
+        self.shuffle = False
         self.setWindowTitle("Vibe Video Player"); self.resize(1600, 900)
         self.setStyleSheet("background:#0a0a0a; color:white;"); self.setMouseTracking(True)
         self.db = MetadataDB()
+        # Initialize metadata scanner
+        self._init_metadata_scanner()
         def icn(k): return QIcon(str(ROOT / "resources" / "icons" / f"{k}.png"))
         self.icns = {k: icn(k) for k in ["play","pause","playlist","folder","settings"]}
         # Load the main app icon (prefer generated sizes) and set window icon
@@ -365,6 +437,7 @@ class MainWindow(QMainWindow):
                             sock.sendall(msg)
                             self._metrics['sent'] += 1
                             logger.debug("Socket writer sent %d bytes to %s", len(msg), p)
+                            time.sleep(0.05)  # Throttle to prevent overwhelming the worker
                         except Exception:
                             logger.exception("Socket send failed for %s", p)
                             self._metrics['send_fail'] += 1
@@ -500,32 +573,56 @@ class MainWindow(QMainWindow):
         self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setIndentation(15)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection); self.tree.setMouseTracking(True)
         self.tree.setStyleSheet("background:#111; border:none;")
-        self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths)); folders_lay.addWidget(self.tree)
+        self.tree.setItemDelegate(LibraryDelegate(self.tree, self.cfg, self.checked_paths, self.db)); folders_lay.addWidget(self.tree)
         self.ov = QWidget(self.tree.viewport()); self.ov.hide(); self.ov.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.backend.attach_prev(int(self.ov.winId()))
 
         self.opt_shelf = QWidget(); self.opt_shelf.hide(); self.opt_shelf.setStyleSheet("background:#181818; border-top:1px solid #333;")
         grid = QGridLayout(self.opt_shelf); self.tog_hide = QCheckBox("Autohide Windowed"); self.tog_hide.setChecked(self.cfg["autohide_windowed"])
         self.tog_hide.toggled.connect(self.save_toggles)
+        self.tog_metadata = QCheckBox("Show Metadata"); self.tog_metadata.setChecked(self.cfg.get("show_metadata", False))
+        self.tog_metadata.toggled.connect(self.toggle_metadata)
         def mk_sl(lbl, key, min_v, max_v):
             box = QWidget(); bl = QVBoxLayout(box); val = self.cfg[key]
             t = QLabel(f"{lbl}: {val}"); t.setStyleSheet("font-size:10px; color:#888;")
             s = QSlider(Qt.Horizontal); s.setRange(min_v, max_v); s.setValue(val)
             s.valueChanged.connect(lambda v, k=key, lb=t, name=lbl: self.set_vis_cfg(k, v, lb, name))
             bl.addWidget(t); bl.addWidget(s); return box
-        grid.addWidget(self.tog_hide, 0, 0); grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 1); grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 1)
+        grid.addWidget(self.tog_hide, 0, 0); grid.addWidget(self.tog_metadata, 0, 1); grid.addWidget(mk_sl("Text", "text_size", 8, 30), 0, 2); grid.addWidget(mk_sl("Size", "card_width", 100, 450), 1, 2)
         folders_lay.addWidget(self.opt_shelf)
         footer = QHBoxLayout(); footer.setContentsMargins(5,5,5,5)
         btn_opts = QPushButton(icon=self.icns["settings"]); btn_opts.clicked.connect(lambda: self.opt_shelf.setVisible(not self.opt_shelf.isVisible()))
         btn_add = QPushButton("+", clicked=self.add_f); btn_add.setFixedSize(30,30)
         footer.addWidget(btn_opts); footer.addStretch(); footer.addWidget(btn_add); folders_lay.addLayout(footer)
         self.sb_l.addTab(folders_tab, "Folders")
-        # Shows tab
-        shows_tab = QWidget(); shows_lay = QVBoxLayout(shows_tab); shows_lay.setContentsMargins(0,0,0,0)
-        self.shows_list = QListWidget(); self.shows_list.setStyleSheet("background:#111; border:none;")
-        self.shows_list.itemDoubleClicked.connect(self.on_show_selected)
-        shows_lay.addWidget(self.shows_list)
-        self.sb_l.addTab(shows_tab, "Shows")
+        # Shows tab - TV Style Browser
+        self.shows_browser = TVStyleShowsWidget(self.db)
+        self.shows_browser.play_video.connect(self._on_play_video_from_shows)
+        
+        shows_tab = QWidget()
+        shows_layout = QVBoxLayout(shows_tab)
+        shows_layout.setContentsMargins(0, 0, 0, 0)
+        shows_layout.addWidget(self.shows_browser)
+        
+        # Watch tab footer with reset options
+        shows_footer = QHBoxLayout()
+        shows_footer.setContentsMargins(5, 5, 5, 5)
+        
+        btn_reset_metadata = QPushButton("🗑️ Reset Metadata")
+        btn_reset_metadata.setToolTip("Clear all TV show metadata and rescan")
+        btn_reset_metadata.clicked.connect(self._reset_show_metadata)
+        
+        btn_reset_db = QPushButton("🗑️ Reset Database")
+        btn_reset_db.setToolTip("Delete entire database and start fresh")
+        btn_reset_db.clicked.connect(self._reset_database)
+        
+        shows_footer.addWidget(btn_reset_metadata)
+        shows_footer.addWidget(btn_reset_db)
+        shows_footer.addStretch()
+        
+        shows_layout.addLayout(shows_footer)
+        
+        self.sb_l.addTab(shows_tab, "Watch")
         self.split.addWidget(self.sb_l)
 
         # Center Player
@@ -539,8 +636,8 @@ class MainWindow(QMainWindow):
         bt_l = QPushButton(icon=self.icns["playlist"]); bt_l.clicked.connect(lambda: self.sb_l.setVisible(not self.sb_l.isVisible()))
         self.bp = QPushButton(icon=self.icns["play"]); self.bp.clicked.connect(self.backend.main_player.pause)
         # Add repeat and shuffle buttons
-        self.bt_repeat = QPushButton("Repeat"); self.bt_repeat.clicked.connect(self.toggle_repeat)
-        self.bt_shuffle = QPushButton("Shuffle"); self.bt_shuffle.clicked.connect(self.toggle_shuffle)
+        self.bt_repeat = QPushButton("Repeat None"); self.bt_repeat.clicked.connect(self.toggle_repeat)
+        self.bt_shuffle = QPushButton("Shuffle Off"); self.bt_shuffle.clicked.connect(self.toggle_shuffle)
         self.vol = QSlider(Qt.Horizontal); self.vol.setFixedWidth(100); self.vol.setRange(0, 100); self.vol.setValue(self.cfg["volume"]); self.vol.valueChanged.connect(self.set_vol_save)
         self.lbl_t = QLabel("0:00 / 0:00"); bt_r = QPushButton(icon=self.icns["playlist"]); bt_r.clicked.connect(lambda: self.sb_r.setVisible(not self.sb_r.isVisible()))
         ctrl_row.addWidget(bt_l); ctrl_row.addSpacing(10); ctrl_row.addWidget(self.bp); ctrl_row.addWidget(self.bt_repeat); ctrl_row.addWidget(self.bt_shuffle); ctrl_row.addStretch()
@@ -557,27 +654,8 @@ class MainWindow(QMainWindow):
         self.tree.itemExpanded.connect(self.on_expand); self.tree.itemEntered.connect(self.on_hover)
         self.tree.itemPressed.connect(self.on_tree_click); self.tree.itemDoubleClicked.connect(self.on_activated)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu); self.tree.customContextMenuRequested.connect(self.on_context)
-        self.tm = QTimer(); self.tm.setInterval(200); self.tm.timeout.connect(self.upd); self.tm.start()
+        self.tm = QTimer(); self.tm.setInterval(500); self.tm.timeout.connect(self.upd); self.tm.start()
         self.backend.set_vol(self.cfg["volume"]); QTimer.singleShot(500, self.ref_initial)
-        # Track current playing path for title display
-        self._now_playing = None
-        # Player modes
-        self.repeat_mode = 'none'  # none, one, all
-        self.shuffle = False
-        # Controller support
-        if INPUTS_AVAILABLE:
-            try:
-                gamepads = inputs.devices.gamepads
-                if gamepads:
-                    self._controller_thread = threading.Thread(target=self._monitor_controller, daemon=True)
-                    self._controller_thread.start()
-                    logger.info("Controller monitoring started")
-                else:
-                    logger.info("No gamepads detected")
-            except Exception:
-                logger.exception("Failed to start controller monitoring")
-        else:
-            logger.info("Inputs library not available for controller support")
 
     def changeEvent(self, event):
         try:
@@ -712,6 +790,7 @@ class MainWindow(QMainWindow):
     def toggle_fs(self): self.showNormal() if self.isFullScreen() else (self.showFullScreen(), self.hide_timer.start())
     def set_vol_save(self, v): self.cfg["volume"] = v; config.save(self.cfg); self.backend.set_vol(v)
     def save_toggles(self): self.cfg["autohide_windowed"] = self.tog_hide.isChecked(); config.save(self.cfg)
+    def toggle_metadata(self): self.cfg["show_metadata"] = self.tog_metadata.isChecked(); config.save(self.cfg); self.tree.viewport().update()
     def set_vis_cfg(self, k, v, lb, name): 
         self.cfg[k] = v; lb.setText(f"{name}: {v}"); config.save(self.cfg)
         self.tree.updateGeometries(); self.tree.viewport().update()
@@ -721,6 +800,9 @@ class MainWindow(QMainWindow):
             p_posix = Path(p).as_posix()
             if p_posix not in self.cfg["folders"]: self.cfg["folders"].append(p_posix); config.save(self.cfg); self.ref()
     def ref_initial(self): self.split.setSizes([self.cfg["sidebar_width"], 800, 300]); self.ref()
+    def rem_fld(self, p):
+        p_posix = Path(p).as_posix()
+        if p_posix in self.cfg["folders"]: self.cfg["folders"].remove(p_posix); config.save(self.cfg); self.ref()
     def ref(self):
         self.tree.clear()
         for f in self.cfg["folders"]:
@@ -728,7 +810,42 @@ class MainWindow(QMainWindow):
             if p.exists():
                 it = QTreeWidgetItem(self.tree, [self.cfg["nicknames"].get(f, p.name)])
                 it.setIcon(0, self.icns["folder"]); it.setData(0, Qt.UserRole, f); it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-        self.populate_shows()
+        self.show_shows_grid()
+    
+    def _init_metadata_scanner(self):
+        """Initialize the metadata scanner."""
+        self.metadata_scanner = MetadataScanner(self.db)
+        # Connect signals
+        self.metadata_scanner.signals.show_detected.connect(self._on_show_detected)
+        self.metadata_scanner.signals.show_not_found.connect(self._on_show_not_found)
+        self.metadata_scanner.signals.progress.connect(self._on_scan_progress)
+        self.metadata_scanner.signals.error.connect(self._on_scan_error)
+        self.metadata_scanner.start()
+    
+    def _on_show_detected(self, folder_path, show_name, tvmaze_id):
+        """Handle show detection."""
+        logger.info(f"Show detected: {show_name}")
+        # Refresh shows grid to show new show
+        self.show_shows_grid()
+    
+    def _on_show_not_found(self, folder_path):
+        """Handle show not found."""
+        logger.info(f"No show found for: {folder_path}")
+    
+    def _on_scan_progress(self, message):
+        """Handle scan progress update."""
+        # Could update a status bar here
+        pass
+    
+    def _on_scan_error(self, folder_path, error_message):
+        """Handle scan error."""
+        logger.error(f"Scan error for {folder_path}: {error_message}")
+    
+    def _scan_folder_for_shows(self, folder_path, parent_tree_item, prompt_on_failure=False):
+        """Queue a folder for metadata scanning."""
+        if hasattr(self, 'metadata_scanner'):
+            self.metadata_scanner.queue_folder(folder_path, silent=not prompt_on_failure)
+
     def on_expand(self, item):
         if item.childCount() > 0: return
         p = Path(item.data(0, Qt.UserRole))
@@ -742,21 +859,10 @@ class MainWindow(QMainWindow):
                     v.setFlags(v.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable); v.setCheckState(0, Qt.Unchecked)
         except Exception:
             logger.exception("Error expanding folder %s", p)
-        # Try to detect if this folder is a TV show
-        if not item.parent():  # root level
-            detected = TVMazeAPI.auto_detect(p.name)
-            if detected:
-                self.db.add_show(detected['tvmaze_id'], detected['name'], detected['image_url'])
-                cache_dir = Path(ROOT) / "resources" / "thumbs"
-                cache_dir.mkdir(exist_ok=True)
-                cache_path = cache_dir / f"show_{detected['tvmaze_id']}.jpg"
-                if not cache_path.exists() and detected['image_url']:
-                    if TVMazeAPI.download_image(detected['image_url'], str(cache_path)):
-                        self.db.update_show_cached_image(detected['tvmaze_id'], str(cache_path))
-                        # Update item icon
-                        pixmap = QPixmap(str(cache_path))
-                        if not pixmap.isNull():
-                            item.setIcon(0, QIcon(pixmap.scaled(32, 32, Qt.KeepAspectRatio)))
+        # Auto-detect TV shows when folder is expanded (with prompt on failure)
+        # This handles both root folders and subfolders
+        self._scan_folder_for_shows(p, item, prompt_on_failure=True)
+        self.show_shows_grid()
     def on_tree_click(self, it, col):
         p = it.data(0, Qt.UserRole)
         if p and not os.path.isdir(p) and self.tree.viewport().mapFromGlobal(QCursor.pos()).x() < 30:
@@ -777,14 +883,26 @@ class MainWindow(QMainWindow):
         if not it and not checked: return
         menu = QMenu(); p = it.data(0, Qt.UserRole) if it else None
         if checked or (p and not os.path.isdir(p)):
-            if menu.addAction("Add Selected to Playlist") == menu.exec(QCursor.pos()):
+            add_pl = menu.addAction("Add Selected to Playlist")
+            rename_meta = menu.addAction("Rename based on Metadata")
+            act = menu.exec(QCursor.pos())
+            if act == add_pl:
                 for path in (checked if checked else [p]):
                     pts = Path(path).parts
                     info = f"{pts[-3]} | {pts[-2]} | {pts[-1]}" if len(pts) >= 3 else Path(path).name
                     li = QListWidgetItem(info); li.setData(Qt.UserRole, path); self.plist.addItem(li)
                 self.checked_paths.clear(); self.tree.viewport().update(); self.sort_pl()
+            elif act == rename_meta:
+                for path in (checked if checked else [p]):
+                    self.rename_file_based_on_metadata(path)
+                self.ref()  # Refresh the tree after renaming
         elif p and os.path.isdir(p):
-            p_all = menu.addAction("Add All to Playlist"); p_rnd = menu.addAction("Add All Randomized"); rem = menu.addAction("Remove Shelf")
+            p_all = menu.addAction("Add All to Playlist"); p_rnd = menu.addAction("Add All Randomized")
+            # Check if folder has metadata
+            has_metadata = self.folder_has_metadata(p)
+            if not has_metadata:
+                search_meta = menu.addAction("Search for TV Show Metadata")
+            rem = menu.addAction("Remove Shelf")
             act = menu.exec(QCursor.pos())
             if act in [p_all, p_rnd]:
                 vids = [str(x.as_posix()) for x in Path(p).rglob("*") if x.suffix.lower() in ('.mp4','.mkv','.avi')]
@@ -795,10 +913,88 @@ class MainWindow(QMainWindow):
                     info = f"{pts[-3]} | {pts[-2]} | {pts[-1]}" if len(pts) >= 3 else Path(v).name
                     li = QListWidgetItem(info); li.setData(Qt.UserRole, v); self.plist.addItem(li)
                 self.sort_pl()
+            elif not has_metadata and act == search_meta:
+                self.search_metadata_for_folder(p)
             elif act == rem: self.rem_fld(p)
-    def rem_fld(self, p):
-        p_posix = Path(p).as_posix()
-        if p_posix in self.cfg["folders"]: self.cfg["folders"].remove(p_posix); config.save(self.cfg); self.ref()
+    def rename_file_based_on_metadata(self, path):
+        try:
+            video_record = self.db.get_video(path)
+            if not video_record or not video_record[9]:  # episode_id
+                QMessageBox.warning(self, "Rename Failed", f"No metadata associated with {Path(path).name}")
+                return
+            episode_id = video_record[9]
+            episode = self.db.get_episode_by_id(episode_id)
+            if not episode:
+                QMessageBox.warning(self, "Rename Failed", f"Episode metadata not found for {Path(path).name}")
+                return
+            season = self.db.get_season_by_id(episode[1])  # season_id
+            if not season:
+                QMessageBox.warning(self, "Rename Failed", f"Season metadata not found for {Path(path).name}")
+                return
+            show = self.db.get_show(season[1])  # show_id
+            if not show:
+                QMessageBox.warning(self, "Rename Failed", f"Show metadata not found for {Path(path).name}")
+                return
+            show_name = show[2]
+            season_num = season[2]
+            episode_num = episode[2]
+            episode_name = episode[3]
+            ext = Path(path).suffix
+            new_name = f"{show_name} - S{season_num:02d}E{episode_num:02d} - {episode_name}{ext}"
+            new_path = Path(path).parent / new_name
+            # Check if file already exists
+            if new_path.exists():
+                QMessageBox.warning(self, "Rename Failed", f"Target file already exists: {new_name}")
+                return
+            # Confirm rename
+            reply = QMessageBox.question(self, "Confirm Rename", 
+                f"Rename:\n{Path(path).name}\nTo:\n{new_name}\n\nThis will rename the file on disk.",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                Path(path).rename(new_path)
+                # Update DB with new path
+                self.db.update_video_path(path, str(new_path))
+                logger.info(f"Renamed {path} to {new_path}")
+            else:
+                logger.info(f"User cancelled rename for {path}")
+        except Exception as e:
+            logger.exception(f"Error renaming {path}")
+            QMessageBox.warning(self, "Rename Failed", f"Error renaming file: {str(e)}")
+    def associate_folder_with_show(self, folder_path, show_data):
+        """Queue folder for metadata scanning with specific show data."""
+        logger.info(f"Queuing folder for manual show association: {folder_path}")
+        if hasattr(self, 'metadata_scanner'):
+            self.metadata_scanner.queue_folder(folder_path, silent=False)
+
+    def folder_has_metadata(self, folder_path):
+        """Check if any video in the folder has associated metadata."""
+        try:
+            vids = [str(x.as_posix()) for x in Path(folder_path).rglob("*") if x.suffix.lower() in ('.mp4','.mkv','.avi')]
+            for vid in vids:
+                video_record = self.db.get_video(vid)
+                if video_record and video_record[9]:  # episode_id is set
+                    return True
+            return False
+        except Exception:
+            logger.exception(f"Error checking metadata for folder {folder_path}")
+            return False
+
+    def search_metadata_for_folder(self, folder_path):
+        """Open dialog to search for TV show metadata and associate with folder."""
+        try:
+            folder = Path(folder_path)
+            dialog = TVMazeSearchDialog(self)
+            # Update title to show which folder
+            dialog.setWindowTitle(f"Search TV Show for: {folder.name}")
+            # Pre-fill with folder name
+            dialog.search_edit.setText(folder.name)
+            dialog.search()
+            if dialog.exec() == QDialog.Accepted and dialog.selected_show:
+                self.associate_folder_with_show(folder_path, dialog.selected_show)
+                QMessageBox.information(self, "Success", f"Associated folder with {dialog.selected_show['name']}")
+        except Exception:
+            logger.exception(f"Error searching metadata for folder {folder_path}")
+
     def sort_pl(self):
         items = []
         for i in range(self.plist.count()):
@@ -822,28 +1018,15 @@ class MainWindow(QMainWindow):
                 logger.exception("Failed to set title in title bar for %s", p)
         except Exception:
             logger.exception("Error handling play metadata for %s", p)
-    def toggle_repeat(self):
-        modes = ['none', 'one', 'all']
-        current_idx = modes.index(self.repeat_mode)
-        self.repeat_mode = modes[(current_idx + 1) % len(modes)]
-        self.bt_repeat.setText(f"Repeat {self.repeat_mode.title()}")
+    def show_shows_grid(self):
+        """Refresh the shows browser grid."""
+        if hasattr(self, 'shows_browser'):
+            self.shows_browser.refresh()
 
-    def populate_shows(self):
-        self.shows_list.clear()
-        shows = self.db.get_all_shows()
-        for show in shows:
-            item = QListWidgetItem(show[2])  # name
-            if show[4]:  # cached_image_path
-                pixmap = QPixmap(show[4])
-                if not pixmap.isNull():
-                    item.setIcon(QIcon(pixmap.scaled(64, 96, Qt.KeepAspectRatio)))
-            item.setData(Qt.UserRole, show[1])  # tvmaze_id
-            self.shows_list.addItem(item)
-
-    def on_show_selected(self, item):
-        tvmaze_id = item.data(Qt.UserRole)
-        # For now, just log; later expand to show seasons/episodes
-        logger.info(f"Selected show: {item.text()} (ID: {tvmaze_id})")
+    def _on_play_video_from_shows(self, video_path):
+        """Handle video playback from shows browser."""
+        if video_path:
+            self.p_m(video_path)
 
     def play_next(self):
         if self.plist.count() == 0: return
@@ -855,14 +1038,18 @@ class MainWindow(QMainWindow):
         if self.shuffle:
             idx = random.randint(0, self.plist.count() - 1)
         else:
-            idx = (idx + 1) % self.plist.count()
+            next_idx = idx + 1
+            # If at last video and not repeating all, don't play
+            if next_idx >= self.plist.count() and self.repeat_mode != 'all':
+                return
+            idx = next_idx % self.plist.count()
         self.plist.setCurrentRow(idx); self.p_m(self.plist.currentItem().data(Qt.UserRole))
     def upd(self):
         m_pos = self.tree.viewport().mapFromGlobal(QCursor.pos())
         if self.ov.isVisible() and not self.tree.viewport().rect().contains(m_pos): self.ov.hide(); self.backend.stop_prev()
         m = self.backend.main_player; state = self.backend.get_state_safe()
         self.bp.setIcon(self.icns["pause" if state == 3 else "play"])
-        if state == 6 and self.plist.count() > 0 and self.repeat_mode != 'none': self.play_next()
+        if state == 6 and self.plist.count() > 0: self.play_next()
         d, cur = m.get_length(), m.get_time()
         if d > 0 and not self.sk.isSliderDown(): self.sk.setValue(int((cur/d)*1000))
         if d > 0: self.lbl_t.setText(f"{cur//60000}:{(cur//1000)%60:02} / {d//60000}:{(d//1000)%60:02}")
@@ -921,11 +1108,6 @@ class MainWindow(QMainWindow):
                     except Exception:
                         logger.exception("Failed to request thumbnail for %s", p)
             it += 1
-    def toggle_repeat(self):
-        modes = ['none', 'one', 'all']
-        current_idx = modes.index(self.repeat_mode)
-        self.repeat_mode = modes[(current_idx + 1) % len(modes)]
-        self.bt_repeat.setText(f"Repeat {self.repeat_mode.title()}")
 
     def _monitor_controller(self):
         try:
@@ -988,6 +1170,12 @@ class MainWindow(QMainWindow):
         self.plist.setCurrentRow(idx); self.p_m(self.plist.currentItem().data(Qt.UserRole))
     def closeEvent(self, e):
         try:
+            # Stop metadata scanner
+            if hasattr(self, 'metadata_scanner'):
+                self.metadata_scanner.stop()
+        except Exception:
+            logger.exception("Error stopping metadata scanner")
+        try:
             # Signal writer thread to exit using a sentinel tuple
             try:
                 seq = next(self._seq)
@@ -1009,3 +1197,90 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("Error releasing backend on close")
         e.accept()
+
+    def _reset_show_metadata(self):
+        """Reset all show metadata and rescan."""
+        reply = QMessageBox.question(self, "Reset Metadata", 
+            "This will clear all TV show metadata (shows, seasons, episodes) and rescan your library.\n\n"
+            "Your video files will not be affected.\n\n"
+            "Do you want to continue?",
+            QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            logger.info("Resetting show metadata...")
+            if self.db.clear_show_metadata():
+                QMessageBox.information(self, "Success", "Show metadata cleared. The library will be rescanned.")
+                # Refresh the shows browser
+                self.shows_browser.refresh()
+                # Trigger rescan
+                for f in self.cfg["folders"]:
+                    self.metadata_scanner.queue_folder(f, silent=True)
+            else:
+                QMessageBox.warning(self, "Error", "Failed to clear show metadata.")
+
+    def _reset_database(self):
+        """Reset the entire database."""
+        reply = QMessageBox.warning(self, "Reset Database", 
+            "⚠️ WARNING: This will DELETE the entire database!\n\n"
+            "All metadata including video associations will be lost.\n\n"
+            "Your video files will not be affected, but the app will need to rescan everything.\n\n"
+            "Do you want to continue?",
+            QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            logger.info("Resetting entire database...")
+            if self.db.reset_database():
+                QMessageBox.information(self, "Success", "Database reset complete. The app will rescan your library.")
+                # Refresh the shows browser
+                self.shows_browser.refresh()
+                # Trigger rescan
+                for f in self.cfg["folders"]:
+                    self.metadata_scanner.queue_folder(f, silent=True)
+            else:
+                QMessageBox.warning(self, "Error", "Failed to reset database.")
+
+class TVMazeSearchDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Search TVMaze for Show")
+        self.setModal(True)
+        self.resize(600, 400)
+        lay = QVBoxLayout(self)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Enter show name...")
+        self.search_edit.returnPressed.connect(self.search)
+        lay.addWidget(self.search_edit)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self.search)
+        lay.addWidget(self.search_btn)
+        self.results_list = QListWidget()
+        self.results_list.itemDoubleClicked.connect(self.accept_selection)
+        lay.addWidget(self.results_list)
+        btn_lay = QHBoxLayout()
+        self.select_btn = QPushButton("Select")
+        self.select_btn.clicked.connect(self.accept_selection)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_lay.addStretch()
+        btn_lay.addWidget(self.select_btn)
+        btn_lay.addWidget(self.cancel_btn)
+        lay.addLayout(btn_lay)
+        self.selected_show = None
+
+    def search(self):
+        query = self.search_edit.text().strip()
+        if not query:
+            return
+        self.results_list.clear()
+        results = TVMazeAPI.search_show(query)
+        for result in results[:10]:  # Limit to 10
+            show = result['show']
+            item = QListWidgetItem(f"{show['name']} ({show.get('premiered', 'Unknown')})")
+            item.setData(Qt.UserRole, show)
+            self.results_list.addItem(item)
+
+    def accept_selection(self):
+        item = self.results_list.currentItem()
+        if item:
+            self.selected_show = item.data(Qt.UserRole)
+            self.accept()
